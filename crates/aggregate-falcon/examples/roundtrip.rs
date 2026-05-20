@@ -167,16 +167,16 @@ fn main() {
             -bytes_saved, ratio.round() as u64
         );
         println!(
-            "  EFFICIENCY:                ✗ aggregation is currently WORSE than concatenation."
+            "  EFFICIENCY:                ✗ aggregation here LOSES to concatenation at this N."
         );
         println!(
-            "                             v1 omits recursive folding (Phase 6 in HANDOFF.md);"
+            "                             The v2 recursive proof is ~constant in size; the"
         );
         println!(
-            "                             proof grows ~linearly in N. Folding is needed for the"
+            "                             analytical crossover is at N ≈ 1024 (see"
         );
         println!(
-            "                             aggregate to be smaller than Σ|sigᵢ|."
+            "                             aggregate-falcon/tests/size_beats_concat.rs)."
         );
     }
 
