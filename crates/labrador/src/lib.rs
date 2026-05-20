@@ -20,5 +20,6 @@ pub mod statement;
 pub mod transcript;
 pub mod verifier;
 pub mod verifier_v2;
+pub mod wire;
 
 pub use statement::{ConstTermConstraint, DotConstraint, Statement, Witness};

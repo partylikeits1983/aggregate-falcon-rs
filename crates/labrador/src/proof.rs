@@ -89,13 +89,114 @@ impl IterationProofV2 {
 /// only `last_msg` on the wire. The verifier walks the iterations forward,
 /// folding each intermediate's statement before reaching `final_iter`'s
 /// statement and running the single concluding `verify_v2`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// The serde implementation routes through `crate::wire`, which emits a
+/// tightly bit-packed encoding (one `q_bitlen`-bit field per ring coefficient,
+/// Golomb-Rice for the Gaussian fields `z0/z1/g`, upper-triangle only for
+/// `g/h`) instead of the bincode-default `Vec<u64>` layout.
+#[derive(Clone, Debug)]
 pub struct AggregateProofV2 {
     pub q_prime: u64,
     pub n_sigs: usize,
     pub beta_sq: i128,
     pub intermediate: Vec<IterationProofV2>,
     pub final_iter: IterationProofV2,
+}
+
+impl serde::Serialize for AggregateProofV2 {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // The example calls `bincode::serialize(&proof)`; bincode encodes
+        // `Vec<u8>` as `len_u64 || bytes`. We emit a single Vec<u8> via
+        // `serialize_bytes` so we don't pay a `Vec<u8>`-as-tuple cost on top.
+        let bytes = crate::wire::pack(self);
+        s.serialize_bytes(&bytes)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AggregateProofV2 {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = AggregateProofV2;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a tightly bit-packed AggregateProofV2 byte stream")
+            }
+            fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Self::Value, E> {
+                crate::wire::unpack(bytes).map_err(E::custom)
+            }
+            fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> Result<Self::Value, E> {
+                crate::wire::unpack(&bytes).map_err(E::custom)
+            }
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                // bincode 1's default `deserialize_bytes` dispatches to
+                // `visit_seq` for `Vec<u8>`; fall back to assembling the byte
+                // buffer manually so we round-trip with `bincode::serialize`.
+                let mut buf: Vec<u8> = Vec::new();
+                while let Some(b) = seq.next_element::<u8>()? {
+                    buf.push(b);
+                }
+                crate::wire::unpack(&buf).map_err(serde::de::Error::custom)
+            }
+        }
+        d.deserialize_byte_buf(V)
+    }
+}
+
+/// Per-field byte breakdown of a serialized [`AggregateProofV2`]. Useful for
+/// understanding where proof bytes go (encoding work in PERF_PLAN.md "Tier 5"
+/// targets specific fields).
+///
+/// Counts are produced by `bincode::serialized_size(&field)` — they match the
+/// bincode wire layout exactly, so the per-field sum is the total proof size
+/// up to a few bytes of struct framing.
+#[derive(Clone, Debug, Default)]
+pub struct ProofBreakdown {
+    /// Sum across all intermediate iterations.
+    pub intermediate_u1: usize,
+    pub intermediate_u2: usize,
+    pub intermediate_p: usize,
+    pub intermediate_bpp: usize,
+    /// Final (deepest) iteration commitments.
+    pub final_u1: usize,
+    pub final_u2: usize,
+    pub final_p: usize,
+    pub final_bpp: usize,
+    /// Final iteration last-message openings (the dominant wire cost).
+    pub final_z0: usize,
+    pub final_z1: usize,
+    pub final_v: usize,
+    pub final_g: usize,
+    pub final_h: usize,
+}
+
+impl ProofBreakdown {
+    pub fn total(&self) -> usize {
+        self.intermediate_u1
+            + self.intermediate_u2
+            + self.intermediate_p
+            + self.intermediate_bpp
+            + self.final_u1
+            + self.final_u2
+            + self.final_p
+            + self.final_bpp
+            + self.final_z0
+            + self.final_z1
+            + self.final_v
+            + self.final_g
+            + self.final_h
+    }
+}
+
+impl AggregateProofV2 {
+    /// Per-field byte breakdown of this proof under the actual on-wire
+    /// (bit-packed) encoding. Implemented by writing each field through the
+    /// same encoder `crate::wire::pack` uses and measuring its output.
+    pub fn breakdown(&self) -> ProofBreakdown {
+        crate::wire::pack_breakdown(self)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

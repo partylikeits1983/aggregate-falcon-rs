@@ -7,11 +7,14 @@
 //!
 //!     cargo run --release --example roundtrip [N]
 
-use aggregate_falcon::{aggregate, verify, FalconInstance, PublicPair};
+use aggregate_falcon::{
+    aggregate_depth, aggregate_with_progress, verify, FalconInstance, Progress, PublicPair,
+};
+use indicatif::{ProgressBar, ProgressStyle};
 use pqcrypto_falcon::falcon512 as pqf;
 use pqcrypto_traits::sign::{DetachedSignature, PublicKey as PqPublicKey};
 use std::env;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const FR_SIG_BYTELEN: usize = 666;
 
@@ -38,6 +41,46 @@ fn falcon_rust_verify(pk_bytes: &[u8], sig_bytes: &[u8], msg: &[u8]) -> bool {
 
 fn fmt_kb(n: usize) -> String {
     format!("{} B ({:.2} KB)", n, n as f64 / 1024.0)
+}
+
+/// indicatif-backed progress reporter for `aggregate_with_progress`. Drives a
+/// single bar of width `depth` (= LaBRADOR iteration count) with a spinner
+/// and elapsed timer. Each LaBRADOR iteration takes ~10 s at N=128, so the
+/// per-iteration tick is fine-grained enough to feel live without flooding
+/// stderr.
+struct CliProgress {
+    bar: ProgressBar,
+    started_at: Instant,
+}
+
+impl CliProgress {
+    fn new(depth: usize) -> Self {
+        let bar = ProgressBar::new(depth as u64);
+        bar.set_style(
+            ProgressStyle::with_template(
+                "  {spinner:.cyan} [{elapsed_precise}] [{bar:24.cyan/blue}] {pos}/{len}  {msg}",
+            )
+            .expect("static template parses")
+            .progress_chars("=>-"),
+        );
+        bar.enable_steady_tick(Duration::from_millis(120));
+        bar.set_message("waiting…");
+        Self { bar, started_at: Instant::now() }
+    }
+
+    fn finish(self) -> Duration {
+        self.bar.finish_and_clear();
+        self.started_at.elapsed()
+    }
+}
+
+impl Progress for CliProgress {
+    fn iter_start(&mut self, k: usize, depth: usize, label: &str) {
+        self.bar.set_message(format!("iter {}/{}  {}", k + 1, depth, label));
+    }
+    fn iter_done(&mut self, k: usize) {
+        self.bar.set_position((k + 1) as u64);
+    }
 }
 
 fn main() {
@@ -127,15 +170,43 @@ fn main() {
     }
 
     // --- aggregate + verify ---
-    println!();
-    let t_agg = Instant::now();
-    let proof = aggregate(&instances).expect("aggregate");
-    let agg_elapsed = t_agg.elapsed();
+    let depth = aggregate_depth(n);
+    println!("\naggregating (depth={depth} LaBRADOR iterations)…");
+    let mut bar = CliProgress::new(depth);
+    let proof = aggregate_with_progress(&instances, &mut bar).expect("aggregate");
+    let agg_elapsed = bar.finish();
     println!("aggregate:               {:.2?}", agg_elapsed);
 
     let proof_bytes = bincode::serialize(&proof).expect("serialize");
     let proof_size = proof_bytes.len();
     println!("aggregate proof:         {}", fmt_kb(proof_size));
+
+    // Per-field byte breakdown — see which fields dominate the proof size so
+    // future encoding work (bit-packing RingElem, Gaussian-entropy coding z/g,
+    // upper-triangle stripping of g/h) can target the biggest movers.
+    let b = proof.breakdown();
+    let bd_total = b.total();
+    let row = |label: &str, n: usize| {
+        let pct = if bd_total > 0 { (n as f64 / bd_total as f64) * 100.0 } else { 0.0 };
+        println!("    {label:<26} {n:>8} B  ({pct:>5.1}%)");
+    };
+    println!("  proof byte breakdown (bincode wire layout):");
+    println!("    -- intermediate iters --");
+    row("u1 (outer-commit v/g)", b.intermediate_u1);
+    row("u2 (outer-commit h)", b.intermediate_u2);
+    row("p  (JL projection)", b.intermediate_p);
+    row("b''(aggregation const)", b.intermediate_bpp);
+    println!("    -- final iter --");
+    row("u1", b.final_u1);
+    row("u2", b.final_u2);
+    row("p", b.final_p);
+    row("b''", b.final_bpp);
+    row("z0 (amortized opening)", b.final_z0);
+    row("z1 (amortized opening)", b.final_z1);
+    row("v  (inner commits)", b.final_v);
+    row("g  (quadratic garbage)", b.final_g);
+    row("h  (linear garbage)", b.final_h);
+    row("breakdown total", bd_total);
 
     let t_ver = Instant::now();
     verify(&pairs, &proof).expect("verify");

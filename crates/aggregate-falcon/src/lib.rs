@@ -22,9 +22,10 @@
 
 use falcon_relation::parse::{decode_instance, decode_public_key, hash_to_point, FalconSig, NONCE_LEN};
 use falcon_relation::relation::build_falcon_statement;
-use labrador::aggregate_v2::{prove_aggregate, verify_aggregate};
+use labrador::aggregate_v2::{prove_aggregate_with_progress, verify_aggregate, ProgressSink};
 use labrador::params::Params;
 use labrador::proof::AggregateProofV2;
+pub use labrador::proof::ProofBreakdown;
 use modring::{Modulus, Ring};
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +42,37 @@ pub struct FalconInstance {
 /// Public-side view of a Falcon instance — what the verifier sees.
 pub type PublicPair = (Vec<u8>, Vec<u8>);
 
+/// Progress callback for `aggregate_with_progress`. Each LaBRADOR iteration
+/// emits one `iter_start` before its work begins and one `iter_done` after
+/// the matching `fold` (or — for the final iteration — after the proof
+/// completes). `depth` is the total iteration count (= `Params::for_n(N).depth`).
+///
+/// The default `()` impl is a no-op, so [`aggregate`] is just
+/// `aggregate_with_progress(sigs, &mut ())`.
+pub trait Progress {
+    fn iter_start(&mut self, k: usize, depth: usize, label: &str);
+    fn iter_done(&mut self, k: usize);
+}
+
+impl Progress for () {
+    fn iter_start(&mut self, _: usize, _: usize, _: &str) {}
+    fn iter_done(&mut self, _: usize) {}
+}
+
+/// Adapter that forwards `aggregate_falcon::Progress` events through the
+/// `labrador::aggregate_v2::ProgressSink` trait so the prover can stay
+/// agnostic of this crate.
+struct SinkAdapter<'a, P: Progress + ?Sized>(&'a mut P);
+
+impl<P: Progress + ?Sized> ProgressSink for SinkAdapter<'_, P> {
+    fn iter_start(&mut self, k: usize, depth: usize, label: &str) {
+        self.0.iter_start(k, depth, label);
+    }
+    fn iter_done(&mut self, k: usize) {
+        self.0.iter_done(k);
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AggregateProof {
     /// Per-signature nonces (needed by the verifier to reconstruct `c`).
@@ -53,6 +85,16 @@ pub struct AggregateProof {
     /// C/D land the intermediate-iteration stripping that makes this shrink
     /// below `N · sizeof(sig)`.
     pub labrador: AggregateProofV2,
+}
+
+impl AggregateProof {
+    /// Per-field byte breakdown of the inner labrador proof. Useful for the
+    /// roundtrip example and for tracking where proof bytes go as encoding
+    /// work lands. Does not include the outer-struct framing (nonces,
+    /// beta_sq) which are small and constant.
+    pub fn breakdown(&self) -> ProofBreakdown {
+        self.labrador.breakdown()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +136,15 @@ impl std::fmt::Display for VerifyError {
 impl std::error::Error for VerifyError {}
 
 pub fn aggregate(sigs: &[FalconInstance]) -> Result<AggregateProof, AggregateError> {
+    aggregate_with_progress(sigs, &mut ())
+}
+
+/// Aggregate, reporting progress to `progress`. See [`Progress`] for the
+/// callback shape. Use this from CLI/example code to drive a progress bar.
+pub fn aggregate_with_progress<P: Progress>(
+    sigs: &[FalconInstance],
+    progress: &mut P,
+) -> Result<AggregateProof, AggregateError> {
     if sigs.is_empty() {
         return Err(AggregateError::EmptyInput);
     }
@@ -115,7 +166,9 @@ pub fn aggregate(sigs: &[FalconInstance]) -> Result<AggregateProof, AggregateErr
     let beta_sq = params.beta_init_sq();
     let (statement, witness, _layout) = build_falcon_statement(&parsed, &ring, beta_sq);
 
-    let labrador = prove_aggregate(&statement, &witness, &params, TRANSCRIPT_DOMAIN);
+    let mut adapter = SinkAdapter(progress);
+    let labrador =
+        prove_aggregate_with_progress(&statement, &witness, &params, TRANSCRIPT_DOMAIN, &mut adapter);
     let nonces: Vec<Vec<u8>> = parsed.iter().map(|p| p.nonce.to_vec()).collect();
 
     Ok(AggregateProof {
@@ -123,6 +176,13 @@ pub fn aggregate(sigs: &[FalconInstance]) -> Result<AggregateProof, AggregateErr
         beta_sq,
         labrador,
     })
+}
+
+/// Return the number of LaBRADOR iterations that `aggregate` of `n_sigs`
+/// signatures will run. Useful for sizing a `ProgressBar` before kicking off
+/// the prover.
+pub fn aggregate_depth(n_sigs: usize) -> usize {
+    Params::for_n(n_sigs).depth
 }
 
 pub fn verify(pairs: &[PublicPair], proof: &AggregateProof) -> Result<(), VerifyError> {

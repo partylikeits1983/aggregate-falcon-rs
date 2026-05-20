@@ -26,12 +26,42 @@ use crate::statement::{Statement, Witness};
 use crate::transcript::Transcript;
 use crate::verifier_v2::verify_v2;
 
-/// Run the multi-iteration recursive prover.
+/// Minimal progress callback for the multi-iteration prover. Each LaBRADOR
+/// iteration emits one `iter_start` before its work begins and one `iter_done`
+/// after the matching `fold` finishes (the final iteration has no fold).
+///
+/// The trait is implemented for `()` as a no-op, so callers that don't care
+/// about progress can keep using [`prove_aggregate`] unchanged.
+pub trait ProgressSink {
+    fn iter_start(&mut self, k: usize, depth: usize, label: &str);
+    fn iter_done(&mut self, k: usize);
+}
+
+impl ProgressSink for () {
+    fn iter_start(&mut self, _: usize, _: usize, _: &str) {}
+    fn iter_done(&mut self, _: usize) {}
+}
+
+/// Run the multi-iteration recursive prover. Thin wrapper that discards
+/// progress events; see [`prove_aggregate_with_progress`] for the live-tracking
+/// variant the example driver uses.
 pub fn prove_aggregate(
     stmt: &Statement,
     witness: &Witness,
     params: &Params,
     transcript_seed: &[u8],
+) -> AggregateProofV2 {
+    prove_aggregate_with_progress(stmt, witness, params, transcript_seed, &mut ())
+}
+
+/// Run the multi-iteration recursive prover, emitting per-iteration progress
+/// to `sink`. Identical to [`prove_aggregate`] otherwise.
+pub fn prove_aggregate_with_progress<P: ProgressSink>(
+    stmt: &Statement,
+    witness: &Witness,
+    params: &Params,
+    transcript_seed: &[u8],
+    sink: &mut P,
 ) -> AggregateProofV2 {
     let depth = params.depth;
     assert!(depth >= 1, "depth must be ≥ 1");
@@ -42,6 +72,7 @@ pub fn prove_aggregate(
     let mut intermediate: Vec<IterationProofV2> = Vec::with_capacity(depth - 1);
 
     for k in 0..(depth - 1) {
+        sink.iter_start(k, depth, "prove_v2 + fold");
         // Snapshot the transcript BEFORE prove_v2; fold needs the same state.
         let mut t_fold = t_prove.clone();
         let proof_k = prove_v2(&cur_stmt, &cur_witness, &params.iterations[k], &mut t_prove);
@@ -56,14 +87,17 @@ pub fn prove_aggregate(
         intermediate.push(proof_k.into_intermediate());
         cur_stmt = statement;
         cur_witness = witness;
+        sink.iter_done(k);
     }
 
+    sink.iter_start(depth - 1, depth, "prove_v2 (final)");
     let final_iter = prove_v2(
         &cur_stmt,
         &cur_witness,
         &params.iterations[depth - 1],
         &mut t_prove,
     );
+    sink.iter_done(depth - 1);
 
     AggregateProofV2 {
         q_prime: stmt.ring.m.q,
