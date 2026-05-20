@@ -20,7 +20,7 @@
 use crate::challenge::sample_challenge;
 use crate::commit::{commit_inner, expand_b_mats, expand_matrix, expand_sym_mats, outer_commit_sym, outer_commit_v};
 use crate::garbage::{compute_g, compute_h, decompose};
-use crate::jl::{project_combined, sample_projection, PROJECTION_ROWS};
+use crate::jl::{build_jl_constraints, project_combined, sample_projection, PROJECTION_ROWS};
 use crate::params::Iteration;
 use crate::proof::{IterationLastMsg, IterationProofV2};
 use crate::prover::{aggregate_full, bind_statement, k_double_prime};
@@ -112,11 +112,22 @@ pub fn prove_v2(
     let p: Vec<i128> = p_arr.iter().copied().collect();
     absorb_p_vec(transcript, LABEL_P, &p);
 
+    // Build the 2λ JL-projection constraints (Protocol 2 §B.6 Step 2) and
+    // splice them into F' so the ψ-aggregation downstream ties `p` to the
+    // witness. The original `stmt` is not mutated.
+    let jl_extra = build_jl_constraints(&pis, &p, n, m);
+    let const_term_extended: Vec<_> = stmt
+        .const_term
+        .iter()
+        .cloned()
+        .chain(jl_extra.into_iter())
+        .collect();
+
     // --- Step 3: aggregate F' const-term constraints ---
     let lambda: u32 = 128;
     let k_pp = k_double_prime(stmt, lambda);
     let q = m.q;
-    let n_fp = stmt.const_term.len();
+    let n_fp = const_term_extended.len();
     let psis: Vec<Vec<u64>> = (0..k_pp)
         .map(|k| {
             (0..n_fp)
@@ -132,7 +143,7 @@ pub fn prove_v2(
     let mut phi_pp: Vec<Vec<Vec<(usize, RingElem)>>> = vec![vec![vec![]; r]; k_pp];
     let mut b_double_prime: Vec<RingElem> = Vec::with_capacity(k_pp);
     for k in 0..k_pp {
-        for (l, c) in stmt.const_term.iter().enumerate() {
+        for (l, c) in const_term_extended.iter().enumerate() {
             let psi = psis[k][l];
             if psi == 0 {
                 continue;

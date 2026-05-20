@@ -17,7 +17,7 @@
 use crate::challenge::sample_challenge;
 use crate::commit::{expand_b_mats, expand_matrix, expand_sym_mats};
 use crate::garbage::decompose;
-use crate::jl::{sample_projection, PROJECTION_ROWS};
+use crate::jl::{build_jl_constraints, sample_projection, PROJECTION_ROWS};
 use crate::params::{Iteration, Stage};
 use crate::proof::IterationProofV2;
 use crate::prover::{aggregate_full, bind_statement, k_double_prime};
@@ -219,15 +219,26 @@ pub fn replay_iteration(
     let c_mats = expand_sym_mats(transcript, LABEL_C, r, t2, kappa1, ring);
     absorb_ring_vec(transcript, LABEL_U1, &proof.u1);
 
-    for i in 0..r {
-        let label = [LABEL_PI, &(i as u64).to_le_bytes()].concat();
-        let _ = sample_projection(transcript, &label, n * D);
-    }
+    let pis: Vec<Vec<Vec<(usize, i8)>>> = (0..r)
+        .map(|i| {
+            let label = [LABEL_PI, &(i as u64).to_le_bytes()].concat();
+            sample_projection(transcript, &label, n * D)
+        })
+        .collect();
     absorb_p_vec(transcript, LABEL_P, &proof.p);
+
+    // Rebuild JL constraints so ψ-aggregation matches prover/verifier.
+    let jl_extra = build_jl_constraints(&pis, &proof.p, n, m);
+    let const_term_extended: Vec<_> = stmt
+        .const_term
+        .iter()
+        .cloned()
+        .chain(jl_extra.into_iter())
+        .collect();
 
     let lambda: u32 = 128;
     let k_pp = k_double_prime(stmt, lambda);
-    let n_fp = stmt.const_term.len();
+    let n_fp = const_term_extended.len();
     let q = m.q;
     let psis: Vec<Vec<u64>> = (0..k_pp)
         .map(|k| {
@@ -251,7 +262,7 @@ pub fn replay_iteration(
     let mut a_pp: Vec<Vec<Vec<RingElem>>> = vec![vec![vec![RingElem::zero(); r]; r]; k_pp];
     let mut phi_pp: Vec<Vec<Vec<(usize, RingElem)>>> = vec![vec![vec![]; r]; k_pp];
     for k in 0..k_pp {
-        for (l, c) in stmt.const_term.iter().enumerate() {
+        for (l, c) in const_term_extended.iter().enumerate() {
             let psi = psis[k][l];
             if psi == 0 {
                 continue;

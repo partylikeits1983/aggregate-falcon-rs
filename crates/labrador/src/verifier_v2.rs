@@ -13,7 +13,7 @@
 use crate::challenge::sample_challenge;
 use crate::commit::{expand_b_mats, expand_matrix, expand_sym_mats, matmul, outer_commit_sym, outer_commit_v};
 use crate::garbage::{decompose, recompose};
-use crate::jl::{sample_projection, PROJECTION_ROWS};
+use crate::jl::{build_jl_constraints, sample_projection, PROJECTION_ROWS};
 use crate::params::Iteration;
 use crate::proof::{IterationProofV2, VerifyError};
 use crate::prover::{aggregate_full, bind_statement, k_double_prime};
@@ -124,7 +124,7 @@ pub fn verify_v2(
     let g_mat: &Vec<Vec<RingElem>> = &last_msg.g;
 
     // --- Step 2 mirror: re-derive Π_i, check JL bound on p ---
-    let _pis: Vec<_> = (0..r)
+    let pis: Vec<Vec<Vec<(usize, i8)>>> = (0..r)
         .map(|i| {
             let label = [LABEL_PI, &(i as u64).to_le_bytes()].concat();
             sample_projection(transcript, &label, n * D)
@@ -139,13 +139,23 @@ pub fn verify_v2(
         return Err(VerifyError::JlBound);
     }
 
+    // Rebuild the JL-projection constraints from Π and p so the downstream
+    // ψ-aggregation matches the prover. Original `stmt` is not mutated.
+    let jl_extra = build_jl_constraints(&pis, &proof.p, n, m);
+    let const_term_extended: Vec<_> = stmt
+        .const_term
+        .iter()
+        .cloned()
+        .chain(jl_extra.into_iter())
+        .collect();
+
     // --- Step 3 mirror: re-derive ψ, check const-term aggregation ---
     let lambda: u32 = 128;
     let k_pp = k_double_prime(stmt, lambda);
     if proof.b_double_prime.len() != k_pp {
         return Err(VerifyError::ProofShape("b'' length"));
     }
-    let n_fp = stmt.const_term.len();
+    let n_fp = const_term_extended.len();
     let q = m.q;
     let psis: Vec<Vec<u64>> = (0..k_pp)
         .map(|k| {
@@ -159,7 +169,7 @@ pub fn verify_v2(
         .collect();
     for k in 0..k_pp {
         let mut expected: u64 = 0;
-        for (l, c) in stmt.const_term.iter().enumerate() {
+        for (l, c) in const_term_extended.iter().enumerate() {
             let prod = m.mul(psis[k][l], c.b0);
             expected = m.add(expected, prod);
         }
@@ -173,7 +183,7 @@ pub fn verify_v2(
     let mut a_pp: Vec<Vec<Vec<RingElem>>> = vec![vec![vec![RingElem::zero(); r]; r]; k_pp];
     let mut phi_pp: Vec<Vec<Vec<(usize, RingElem)>>> = vec![vec![vec![]; r]; k_pp];
     for k in 0..k_pp {
-        for (l, c) in stmt.const_term.iter().enumerate() {
+        for (l, c) in const_term_extended.iter().enumerate() {
             let psi = psis[k][l];
             if psi == 0 {
                 continue;
