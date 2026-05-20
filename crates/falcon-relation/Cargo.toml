@@ -1,0 +1,16 @@
+[package]
+name = "falcon-relation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Falcon-512 ring arithmetic and LaBRADOR relation encoding"
+
+[dependencies]
+modring = { path = "../modring" }
+labrador = { path = "../labrador" }
+sha3 = "0.10"
+
+[dev-dependencies]
+proptest.workspace = true
+pqcrypto-falcon = "0.4"
+pqcrypto-traits = "0.3"

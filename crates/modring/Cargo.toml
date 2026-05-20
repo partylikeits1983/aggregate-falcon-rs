@@ -1,0 +1,11 @@
+[package]
+name = "modring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LaBRADOR base field Fq and ring Z_Q[X]/(X^64+1) with 2-splitting CRT"
+
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true

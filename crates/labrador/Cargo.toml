@@ -1,0 +1,12 @@
+[package]
+name = "labrador"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LaBRADOR-style proof system over the two-splitting LaBRADOR ring"
+
+[dependencies]
+modring = { path = "../modring" }
+
+[dev-dependencies]
+proptest.workspace = true

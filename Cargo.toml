@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/modring",
+    "crates/falcon-relation",
+    "crates/labrador",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+proptest = "1"
