@@ -17,5 +17,5 @@ pub mod poly;
 pub mod rng;
 
 pub use crt::{CrtRepr, Ring, H};
-pub use modulus::{find_prime_5mod8, is_prime, Modulus};
+pub use modulus::{find_prime_5mod8, find_prime_5mod8_below, is_prime, Modulus};
 pub use poly::{RingElem, D};

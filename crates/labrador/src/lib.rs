@@ -8,6 +8,7 @@
 
 pub mod challenge;
 pub mod commit;
+pub mod fold;
 pub mod garbage;
 pub mod jl;
 pub mod params;

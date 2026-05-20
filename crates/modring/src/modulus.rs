@@ -226,6 +226,35 @@ pub fn find_prime_5mod8(min_value: u64) -> u64 {
     }
 }
 
+/// Largest prime `< max_exclusive` congruent to `5 (mod 8)`.
+///
+/// Used by the LaBRADOR parameter selection: a prime `q'` strictly below
+/// `2^q_bitlen` ensures the per-iteration decomposition base satisfies
+/// `b^t ≥ 2^q_bitlen > q'`, so the centered base-`b` chunks recompose to the
+/// original element exactly (lossless decomposition — required for the
+/// recursion's fold step).
+pub fn find_prime_5mod8_below(max_exclusive: u64) -> u64 {
+    assert!(max_exclusive > 5, "max_exclusive must exceed the smallest 5-mod-8 prime");
+    // Largest m < max_exclusive with m ≡ 5 (mod 8).
+    let mut c: u64 = {
+        let r = (max_exclusive - 1) % 8;
+        if r >= 5 {
+            (max_exclusive - 1) - (r - 5)
+        } else {
+            (max_exclusive - 1).saturating_sub(r + 3)
+        }
+    };
+    loop {
+        if c < 5 {
+            panic!("no prime ≡ 5 (mod 8) below {max_exclusive}");
+        }
+        if is_prime(c) {
+            return c;
+        }
+        c -= 8;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -129,6 +129,27 @@ impl Params {
             iterations: iters,
         }
     }
+
+    /// Choose the LaBRADOR ring modulus `q'` for this `N`.
+    ///
+    /// Returns the largest prime `≡ 5 (mod 8)` strictly below `2^q_bitlen`,
+    /// which guarantees each iteration's centered base-`b₁`/`b₂` decomposition
+    /// satisfies `b^t ≥ 2^q_bitlen > q'` — lossless, as required for the
+    /// recursion's fold to express `v_i = Σ_l b₁^l · v_i^(l)` as a linear
+    /// constraint over the new witness.
+    pub fn select_modulus(&self) -> u64 {
+        modring::find_prime_5mod8_below(1u64 << self.q_bitlen)
+    }
+
+    /// Paper-correct initial norm bound `β² = β_init²`.
+    ///
+    /// Replaces the conservative `1<<60` hardcode used during early phases:
+    /// once JL projection constraints tie `p` to `w`, this is the actual
+    /// bound the verifier checks against.
+    pub fn beta_init_sq(&self) -> i128 {
+        let b = self.iterations[0].beta_list[0];
+        (b * b).ceil() as i128
+    }
 }
 
 impl Iteration {

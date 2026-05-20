@@ -39,6 +39,7 @@ use sha3::{
 /// accidentally read stale challenges), and every `challenge_bytes` updates
 /// the internal hash with a domain-separator label so subsequent challenges
 /// remain bound to the call site.
+#[derive(Clone)]
 pub struct Transcript {
     hasher: Shake256,
 }
