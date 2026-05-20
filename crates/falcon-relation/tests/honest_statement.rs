@@ -126,3 +126,97 @@ fn tampering_a_signature_byte_breaks_falcon_eq() {
         "perturbing an s2 slot must violate the Falcon-eq slot constraints"
     );
 }
+
+/// Exercise every §F.2 form-constraint family. Each tamper targets a position
+/// that the *form* constraints (not the Falcon-eq or four-square equations)
+/// would catch — so a missing constraint family would silently let one of
+/// these slip through.
+#[test]
+fn form_constraints_catch_each_padding_or_structure_violation() {
+    let ring = ring();
+    let sigs = fresh_sigs(4);
+    let beta_sq: i128 = 1 << 60;
+    let (stmt, witness, layout) = build_falcon_statement(&sigs, &ring, beta_sq);
+    assert!(satisfies(&stmt, &witness));
+
+    // (i_y, i_yp) for sigs 1 (in-range/matching) and 2 (in-range/matching for
+    // a different i_yp). ρ=2, num_y=2, num_yp=2.
+    // sig 1: index=1, index'=1; sig 2: index=1, index'=2;
+    // sig 3: index=2, index'=1; sig 4: index=2, index'=2.
+
+    // (1) y_{·,j} padding: y_{1,1} should be zero at R-position 3 (sig 3 not
+    //     in i_y=1's range). Putting any value there must break.
+    {
+        let y_pad = layout.y_idx(1, 1);
+        let mut bad = witness.clone();
+        let pos = 8 * (3 - 1); // R-position for sig 3, slot 0
+        bad.w[y_pad][pos].c[0] = ring.m.add(bad.w[y_pad][pos].c[0], 1);
+        assert!(!satisfies(&stmt, &bad), "y padding (out-of-range R-position) not caught");
+    }
+
+    // (2) y'_{·,j} padding: y'_{1,1} should be zero at R-position 2 (sig 2 has
+    //     index'=2, not 1). Tamper there must break.
+    {
+        let yp_pad = layout.yp_idx(1, 1);
+        let mut bad = witness.clone();
+        let pos = 8 * (2 - 1);
+        bad.w[yp_pad][pos].c[0] = ring.m.add(bad.w[yp_pad][pos].c[0], 1);
+        assert!(!satisfies(&stmt, &bad), "y' padding (non-matching R-position) not caught");
+    }
+
+    // (3) y'_{·,j} σ_{-1}^S consistency: at sig 1 (matching y'_{1,1}), the
+    //     l=5 coefficient of slot 2 of y'_{1,1} should equal -y_{1,1}'s l=59
+    //     coefficient. Flip y'_{1,1} alone.
+    {
+        let yp_match = layout.yp_idx(1, 1);
+        let mut bad = witness.clone();
+        bad.w[yp_match][2].c[5] = ring.m.add(bad.w[yp_match][2].c[5], 1);
+        assert!(!satisfies(&stmt, &bad), "y' σ_{{-1}}^S equality not caught");
+    }
+
+    // (4) e_· structure: at sig 1 (in-range for e_1), slot 0 coefficient
+    //     l=1 should be zero (only c[0] is free for slots 0..3). Tamper.
+    {
+        let e_vec = layout.e_idx(1);
+        let mut bad = witness.clone();
+        bad.w[e_vec][0].c[1] = ring.m.add(bad.w[e_vec][0].c[1], 1);
+        assert!(!satisfies(&stmt, &bad), "ε structure (slot 0 c[1] should be zero) not caught");
+    }
+
+    // (5) e_· structure for slot ≥ 4: at sig 1, slot 4 should be entirely
+    //     zero. Tamper any coefficient.
+    {
+        let e_vec = layout.e_idx(1);
+        let mut bad = witness.clone();
+        bad.w[e_vec][4].c[0] = ring.m.add(bad.w[e_vec][4].c[0], 1);
+        assert!(!satisfies(&stmt, &bad), "ε structure (slot 4 must be zero) not caught");
+    }
+
+    // (6) e_· padding (out-of-range R-position): e_1 should be zero at sig 3.
+    {
+        let e_vec = layout.e_idx(1);
+        let mut bad = witness.clone();
+        let pos = 8 * (3 - 1);
+        bad.w[e_vec][pos].c[0] = ring.m.add(bad.w[e_vec][pos].c[0], 1);
+        assert!(!satisfies(&stmt, &bad), "ε padding (out-of-range) not caught");
+    }
+
+    // (7) e'_· σ_{-1}^S consistency: at sig 1 (matching e'_1), the l=2
+    //     coefficient of slot 2 of e'_1 should match σ_{-1}^S(e_1)'s slot 2
+    //     l=2 coefficient. Tamper e' alone.
+    {
+        let ep_vec = layout.ep_idx(1);
+        let mut bad = witness.clone();
+        bad.w[ep_vec][2].c[2] = ring.m.add(bad.w[ep_vec][2].c[2], 1);
+        assert!(!satisfies(&stmt, &bad), "e' σ_{{-1}}^S equality not caught");
+    }
+
+    // (8) e'_· padding: e'_1 should be zero at sig 2 (index'(2) = 2, not 1).
+    {
+        let ep_vec = layout.ep_idx(1);
+        let mut bad = witness.clone();
+        let pos = 8 * (2 - 1);
+        bad.w[ep_vec][pos].c[3] = ring.m.add(bad.w[ep_vec][pos].c[3], 1);
+        assert!(!satisfies(&stmt, &bad), "e' padding (non-matching R-position) not caught");
+    }
+}

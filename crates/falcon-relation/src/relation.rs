@@ -361,7 +361,6 @@ pub fn add_falcon_eq_constraints(
     let m = &ring.m;
     let q = FALCON_Q as u64;
     let y_mono = RingElem::monomial(m, 1);
-    let n_s = layout.n_s();
 
     for (sig_idx, sig) in sigs.iter().enumerate() {
         let i = sig_idx + 1;
@@ -376,20 +375,17 @@ pub fn add_falcon_eq_constraints(
         let v = layout.v_idx();
 
         for k in 0..C {
-            let mut phi_y1 = vec![RingElem::zero(); n_s];
-            let mut phi_y2 = vec![RingElem::zero(); n_s];
-            let mut phi_v = vec![RingElem::zero(); n_s];
+            let phi_y1 = vec![(pos + k, RingElem::constant(m, 1))];
+            let phi_v = vec![(pos + k, RingElem::constant(m, q))];
 
-            phi_y1[pos + k] = RingElem::constant(m, 1);
-            phi_v[pos + k] = RingElem::constant(m, q);
-
+            let mut phi_y2 = Vec::with_capacity(C);
             for b in 0..C {
                 let coef = if b <= k {
                     h_slots[k - b].clone()
                 } else {
                     ring.mul(&y_mono, &h_slots[k + C - b])
                 };
-                phi_y2[pos + b] = coef;
+                phi_y2.push((pos + b, coef));
             }
 
             stmt.full.push(DotConstraint {
@@ -442,12 +438,190 @@ pub fn add_four_square_constraints(
     }
 }
 
+/// `σ_{-1}^S(Y^l) ∈ S` — the *coefficient-extraction* sparse phi entry:
+/// `ct(σ_{-1}^S(Y^l) · a) = a.c[l]` for every `a ∈ S` (the §6.2(B) trick,
+/// instantiated on `S` rather than `R`).
+fn coef_extract_phi(l: usize, m: &Modulus) -> RingElem {
+    if l == 0 {
+        RingElem::constant(m, 1)
+    } else {
+        let mut p = RingElem::zero();
+        p.c[D - l] = m.neg(1);
+        p
+    }
+}
+
+fn full_zero_constraint(idx: usize, pos: usize, m: &Modulus) -> DotConstraint {
+    DotConstraint {
+        a: vec![],
+        phi: vec![(idx, vec![(pos, RingElem::constant(m, 1))])],
+        b: RingElem::zero(),
+    }
+}
+
+fn coef_zero_constraint(idx: usize, pos: usize, l: usize, m: &Modulus) -> ConstTermConstraint {
+    ConstTermConstraint {
+        a: vec![],
+        phi: vec![(idx, vec![(pos, coef_extract_phi(l, m))])],
+        b0: 0,
+    }
+}
+
+/// Constraint asserting `W_{conj}[pos].c[l] = σ_{-1}^S(W_{src}[pos]).c[l]`.
+///
+/// `l = 0`: enforces `W_{conj}.c[0] − W_{src}.c[0] = 0`.
+/// `l ≥ 1`: enforces `W_{conj}.c[l] + W_{src}.c[d'−l] = 0` (since
+/// `σ_{-1}^S(P).c[l] = −P.c[d'−l]` for `l ≥ 1`).
+fn sigma_equality_constraint(
+    conj_idx: usize,
+    src_idx: usize,
+    pos: usize,
+    l: usize,
+    m: &Modulus,
+) -> ConstTermConstraint {
+    let phi_conj = coef_extract_phi(l, m);
+    let phi_src = if l == 0 {
+        RingElem::constant(m, m.neg(1))
+    } else {
+        coef_extract_phi(D - l, m)
+    };
+    ConstTermConstraint {
+        a: vec![],
+        phi: vec![
+            (conj_idx, vec![(pos, phi_conj)]),
+            (src_idx, vec![(pos, phi_src)]),
+        ],
+        b0: 0,
+    }
+}
+
+/// §F.2 padding for the `y_{·,j}` vectors: out-of-range R-positions are zero.
+pub fn add_padding_constraints_y(stmt: &mut Statement, layout: &WitnessLayout, ring: &Ring) {
+    let m = &ring.m;
+    let n = layout.n_sigs;
+    for i_y in 1..=layout.num_y {
+        let k_lo = (i_y - 1) * layout.rho + 1;
+        let k_hi = (i_y * layout.rho).min(n);
+        for j in 1..=2 {
+            let vec_idx = layout.y_idx(i_y, j);
+            for k in 1..=n {
+                if k_lo <= k && k <= k_hi {
+                    continue;
+                }
+                let pos = C * (k - 1);
+                for t in 0..C {
+                    stmt.full.push(full_zero_constraint(vec_idx, pos + t, m));
+                }
+            }
+        }
+    }
+}
+
+/// §F.2 conjugation + padding for the `y'_{·,j}` vectors: at the matching
+/// R-position `k ≡ i_yp (mod ρ)`, every coefficient of `y'_{i_yp,j}[k]`
+/// matches `σ_{-1}^S` of the corresponding coefficient of `y_{idx(k),j}[k]`;
+/// elsewhere `y'_{i_yp,j}[k] = 0 ∈ R`.
+pub fn add_form_constraints_yp(stmt: &mut Statement, layout: &WitnessLayout, ring: &Ring) {
+    let m = &ring.m;
+    let n = layout.n_sigs;
+    for i_yp in 1..=layout.num_yp {
+        for j in 1..=2 {
+            let yp_vec = layout.yp_idx(i_yp, j);
+            for k in 1..=n {
+                let pos = C * (k - 1);
+                if layout.index_prime(k) == i_yp {
+                    let y_vec = layout.y_idx(layout.index(k), j);
+                    for t in 0..C {
+                        for l in 0..D {
+                            stmt.const_term.push(sigma_equality_constraint(
+                                yp_vec,
+                                y_vec,
+                                pos + t,
+                                l,
+                                m,
+                            ));
+                        }
+                    }
+                } else {
+                    for t in 0..C {
+                        stmt.full.push(full_zero_constraint(yp_vec, pos + t, m));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// §F.2 structure + padding for the `e_·` vectors: in-range positions hold an
+/// `ε ∈ R_{q'}` of degree ≤ 4 (so under ϕ only slots 0..3, coefficient
+/// `Y^0`, are free; everything else is zero); out-of-range positions are
+/// zero in `R`.
+pub fn add_form_constraints_e(stmt: &mut Statement, layout: &WitnessLayout, ring: &Ring) {
+    let m = &ring.m;
+    let n = layout.n_sigs;
+    for i_y in 1..=layout.num_y {
+        let k_lo = (i_y - 1) * layout.rho + 1;
+        let k_hi = (i_y * layout.rho).min(n);
+        let e_vec = layout.e_idx(i_y);
+        for k in 1..=n {
+            let pos = C * (k - 1);
+            if k_lo <= k && k <= k_hi {
+                for t in 0..C {
+                    if t < 4 {
+                        for l in 1..D {
+                            stmt.const_term.push(coef_zero_constraint(e_vec, pos + t, l, m));
+                        }
+                    } else {
+                        stmt.full.push(full_zero_constraint(e_vec, pos + t, m));
+                    }
+                }
+            } else {
+                for t in 0..C {
+                    stmt.full.push(full_zero_constraint(e_vec, pos + t, m));
+                }
+            }
+        }
+    }
+}
+
+/// §F.2 conjugation + padding for the `e'_·` vectors: matching positions
+/// equate `e'_{i_ep}[k] = σ_{-1}^S(e_{idx(k)}[k])` slot-wise; non-matching
+/// positions are zero in `R`.
+pub fn add_form_constraints_ep(stmt: &mut Statement, layout: &WitnessLayout, ring: &Ring) {
+    let m = &ring.m;
+    let n = layout.n_sigs;
+    for i_ep in 1..=layout.num_yp {
+        let ep_vec = layout.ep_idx(i_ep);
+        for k in 1..=n {
+            let pos = C * (k - 1);
+            if layout.index_prime(k) == i_ep {
+                let e_vec = layout.e_idx(layout.index(k));
+                for t in 0..C {
+                    for l in 0..D {
+                        stmt.const_term.push(sigma_equality_constraint(
+                            ep_vec,
+                            e_vec,
+                            pos + t,
+                            l,
+                            m,
+                        ));
+                    }
+                }
+            } else {
+                for t in 0..C {
+                    stmt.full.push(full_zero_constraint(ep_vec, pos + t, m));
+                }
+            }
+        }
+    }
+}
+
 /// Build the LaBRADOR statement, honest witness, and layout for an aggregation
 /// of `N` decoded Falcon-512 signatures.
 ///
 /// `beta_sq` is the global ℓ²-norm bound on the entire padded witness — set
-/// generously for Phase 3c (a tight bound comes with the §F.2 form constraints
-/// and the §6.2 quotient-norm analysis in a later phase).
+/// generously for Phase 3c (a tight bound comes with the §6.2 quotient-norm
+/// analysis in a later phase).
 pub fn build_falcon_statement(
     sigs: &[FalconSig],
     ring: &Ring,
@@ -464,6 +638,10 @@ pub fn build_falcon_statement(
     };
     add_falcon_eq_constraints(&mut stmt, &layout, sigs, ring);
     add_four_square_constraints(&mut stmt, &layout, FALCON_BETA_SQ, ring);
+    add_padding_constraints_y(&mut stmt, &layout, ring);
+    add_form_constraints_yp(&mut stmt, &layout, ring);
+    add_form_constraints_e(&mut stmt, &layout, ring);
+    add_form_constraints_ep(&mut stmt, &layout, ring);
     (stmt, witness, layout)
 }
 

@@ -28,12 +28,18 @@ use modring::{Ring, RingElem};
 /// are stored. By convention `i ≤ j`; the pair `(i, j)` represents both
 /// `a_{i,j}` and `a_{j,i}` (which are equal), counted once in `i = j` and
 /// twice in `i ≠ j` when evaluating `Σ a_{i,j} ⟨w_i, w_j⟩`.
+///
+/// `phi` is doubly sparse: outer entries `(i, sparse_φ)` skip witness vectors
+/// with `φ_i = 0`, and `sparse_φ` itself lists only `(position, S_element)`
+/// pairs with the rest of `φ_i` implicit zero. The §F.2 form constraints
+/// produce many phis with one or two non-zero positions in a length-`8N`
+/// vector; a dense representation would balloon both compute and memory.
 #[derive(Clone, Debug)]
 pub struct DotConstraint {
     /// `(i, j, a_{i,j})` with `i ≤ j`.
     pub a: Vec<(usize, usize, RingElem)>,
-    /// `(i, φ_i)` — for indices `i` where `φ_i ≠ 0`. Each `φ_i` has length `n`.
-    pub phi: Vec<(usize, Vec<RingElem>)>,
+    /// `(i, [(pos, p)])` — `φ_i[pos] = p`, all other positions zero.
+    pub phi: Vec<(usize, Vec<(usize, RingElem)>)>,
     /// Right-hand side `b ∈ S_{q'}`.
     pub b: RingElem,
 }
@@ -43,7 +49,7 @@ pub struct DotConstraint {
 #[derive(Clone, Debug)]
 pub struct ConstTermConstraint {
     pub a: Vec<(usize, usize, RingElem)>,
-    pub phi: Vec<(usize, Vec<RingElem>)>,
+    pub phi: Vec<(usize, Vec<(usize, RingElem)>)>,
     /// Right-hand side as a single coefficient of `Z_{q'}` — only the
     /// constant term is checked.
     pub b0: u64,
@@ -106,6 +112,22 @@ pub fn ring_inner_product(ring: &Ring, a: &[RingElem], b: &[RingElem]) -> RingEl
     acc
 }
 
+fn sparse_phi_contribution(
+    phi: &[(usize, Vec<(usize, RingElem)>)],
+    ring: &Ring,
+    w: &Witness,
+) -> RingElem {
+    let m = &ring.m;
+    let mut acc = RingElem::zero();
+    for (i, sparse) in phi {
+        for (pos, p) in sparse {
+            let term = ring.mul(p, &w.w[*i][*pos]);
+            acc = acc.add(m, &term);
+        }
+    }
+    acc
+}
+
 /// Evaluate a `DotConstraint` directly on a witness, returning
 /// `Σ a_{i,j} ⟨w_i, w_j⟩ + Σ ⟨φ_i, w_i⟩ − b`.
 pub fn eval_full(c: &DotConstraint, ring: &Ring, w: &Witness) -> RingElem {
@@ -121,10 +143,8 @@ pub fn eval_full(c: &DotConstraint, ring: &Ring, w: &Witness) -> RingElem {
         }
         acc = acc.add(m, &term);
     }
-    for (i, phi_i) in &c.phi {
-        let ip = ring_inner_product(ring, phi_i, &w.w[*i]);
-        acc = acc.add(m, &ip);
-    }
+    let lin = sparse_phi_contribution(&c.phi, ring, w);
+    acc = acc.add(m, &lin);
     acc.sub(m, &c.b)
 }
 
@@ -140,10 +160,8 @@ pub fn eval_const_term(c: &ConstTermConstraint, ring: &Ring, w: &Witness) -> u64
         }
         acc = acc.add(m, &term);
     }
-    for (i, phi_i) in &c.phi {
-        let ip = ring_inner_product(ring, phi_i, &w.w[*i]);
-        acc = acc.add(m, &ip);
-    }
+    let lin = sparse_phi_contribution(&c.phi, ring, w);
+    acc = acc.add(m, &lin);
     m.sub(acc.c[0], c.b0)
 }
 
@@ -204,6 +222,10 @@ mod tests {
         assert!(satisfies(&s, &w));
     }
 
+    fn into_sparse(v: Vec<RingElem>) -> Vec<(usize, RingElem)> {
+        v.into_iter().enumerate().collect()
+    }
+
     #[test]
     fn linear_constraint_built_from_witness_is_satisfied() {
         // Construct: ⟨φ_0, w_0⟩ - b = 0, where b is the actual inner product.
@@ -217,7 +239,7 @@ mod tests {
             r: 1,
             full: vec![DotConstraint {
                 a: vec![],
-                phi: vec![(0, phi0)],
+                phi: vec![(0, into_sparse(phi0))],
                 b,
             }],
             const_term: vec![],
@@ -264,7 +286,7 @@ mod tests {
             r: 1,
             full: vec![DotConstraint {
                 a: vec![],
-                phi: vec![(0, phi0)],
+                phi: vec![(0, into_sparse(phi0))],
                 b,
             }],
             const_term: vec![],
