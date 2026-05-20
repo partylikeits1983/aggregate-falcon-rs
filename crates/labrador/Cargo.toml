@@ -7,6 +7,13 @@ description = "LaBRADOR-style proof system over the two-splitting LaBRADOR ring"
 
 [dependencies]
 modring = { path = "../modring" }
+sha3 = "0.10"
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "1", default-features = false }
 
 [dev-dependencies]
 proptest.workspace = true
+falcon-relation = { path = "../falcon-relation" }
+pqcrypto-falcon = "0.4"
+pqcrypto-traits = "0.3"
+serde_json = "1"

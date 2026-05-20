@@ -6,6 +6,12 @@
 //! - `params`, `commit`, `transcript`, `challenge`, `jl`, `garbage`,
 //!   `prover`, `verifier`, `fold`, `proof` — pending.
 
+pub mod challenge;
+pub mod commit;
+pub mod garbage;
+pub mod jl;
+pub mod params;
 pub mod statement;
+pub mod transcript;
 
 pub use statement::{ConstTermConstraint, DotConstraint, Statement, Witness};
