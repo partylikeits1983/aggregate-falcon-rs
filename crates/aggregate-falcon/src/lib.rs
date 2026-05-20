@@ -22,7 +22,9 @@
 
 use falcon_relation::parse::{decode_instance, decode_public_key, hash_to_point, FalconSig, NONCE_LEN};
 use falcon_relation::relation::build_falcon_statement;
-use labrador::aggregate_v2::{prove_aggregate_with_progress, verify_aggregate, ProgressSink};
+use labrador::aggregate_v2::{
+    prove_aggregate_with_progress, verify_aggregate_with_progress, ProgressSink,
+};
 use labrador::params::Params;
 use labrador::proof::AggregateProofV2;
 pub use labrador::proof::ProofBreakdown;
@@ -186,6 +188,17 @@ pub fn aggregate_depth(n_sigs: usize) -> usize {
 }
 
 pub fn verify(pairs: &[PublicPair], proof: &AggregateProof) -> Result<(), VerifyError> {
+    verify_with_progress(pairs, proof, &mut ())
+}
+
+/// Verify, reporting per-iteration progress to `progress`. See [`Progress`] for
+/// the callback shape. Use this from CLI/example code to drive a progress bar
+/// during the LaBRADOR verifier's depth-K fold loop and final `verify_v2`.
+pub fn verify_with_progress<P: Progress>(
+    pairs: &[PublicPair],
+    proof: &AggregateProof,
+    progress: &mut P,
+) -> Result<(), VerifyError> {
     if pairs.len() != proof.nonces.len() {
         return Err(VerifyError::SigCountMismatch {
             got: pairs.len(),
@@ -204,7 +217,9 @@ pub fn verify(pairs: &[PublicPair], proof: &AggregateProof) -> Result<(), Verify
     let ring = Ring::new(Modulus::new(q_prime));
 
     let stmt = build_verifier_statement(pairs, &proof.nonces, proof.beta_sq, &ring)?;
-    verify_aggregate(&stmt, &proof.labrador, &params, TRANSCRIPT_DOMAIN).map_err(VerifyError::Labrador)
+    let mut adapter = SinkAdapter(progress);
+    verify_aggregate_with_progress(&stmt, &proof.labrador, &params, TRANSCRIPT_DOMAIN, &mut adapter)
+        .map_err(VerifyError::Labrador)
 }
 
 /// Build the verifier-side LaBRADOR `Statement` from public-only inputs

@@ -119,12 +119,26 @@ pub fn prove_aggregate_with_progress<P: ProgressSink>(
     }
 }
 
-/// Run the multi-iteration recursive verifier.
+/// Run the multi-iteration recursive verifier. Thin wrapper that discards
+/// progress events; see [`verify_aggregate_with_progress`] for the live-tracking
+/// variant the example driver uses.
 pub fn verify_aggregate(
     stmt: &Statement,
     proof: &AggregateProofV2,
     params: &Params,
     transcript_seed: &[u8],
+) -> Result<(), VerifyError> {
+    verify_aggregate_with_progress(stmt, proof, params, transcript_seed, &mut ())
+}
+
+/// Run the multi-iteration recursive verifier, emitting per-iteration progress
+/// to `sink`. Identical to [`verify_aggregate`] otherwise.
+pub fn verify_aggregate_with_progress<P: ProgressSink>(
+    stmt: &Statement,
+    proof: &AggregateProofV2,
+    params: &Params,
+    transcript_seed: &[u8],
+    sink: &mut P,
 ) -> Result<(), VerifyError> {
     let depth = params.depth;
     if proof.intermediate.len() != depth.saturating_sub(1) {
@@ -139,6 +153,7 @@ pub fn verify_aggregate(
     let mut t = Transcript::new(transcript_seed);
 
     for (k, inter_proof) in proof.intermediate.iter().enumerate() {
+        sink.iter_start(k, depth, "fold_statement");
         let nu = params.iterations[k + 1].prev_nu as usize;
         let mu = params.iterations[k + 1].prev_mu as usize;
         let ts = Instant::now();
@@ -146,11 +161,14 @@ pub fn verify_aggregate(
         stage_timing::record("verify_fold_statement", ts.elapsed());
         stage_timing::mark("verify-iter-end");
         cur_stmt = next_stmt;
+        sink.iter_done(k);
     }
 
+    sink.iter_start(depth - 1, depth, "verify_v2 (final)");
     let ts = Instant::now();
     let res = verify_v2(&cur_stmt, &proof.final_iter, &params.iterations[depth - 1], &mut t);
     stage_timing::record("verify_v2_final", ts.elapsed());
     stage_timing::mark("verify-iter-end");
+    sink.iter_done(depth - 1);
     res
 }

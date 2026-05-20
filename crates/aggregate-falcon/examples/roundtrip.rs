@@ -14,7 +14,8 @@
 //!     verifier loop. Stages mirror the paper's protocol steps. Off by default.
 
 use aggregate_falcon::{
-    aggregate_depth, aggregate_with_progress, verify, FalconInstance, Progress, PublicPair,
+    aggregate_depth, aggregate_with_progress, verify_with_progress, FalconInstance, Progress,
+    PublicPair,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use pqcrypto_falcon::falcon512 as pqf;
@@ -304,10 +305,18 @@ fn main() {
     row("h  (linear garbage)", b.final_h);
     row("breakdown total", bd_total);
 
-    let t_ver = Instant::now();
-    verify(&pairs, &proof).expect("verify");
-    let ver_elapsed = t_ver.elapsed();
-    println!("verify:                  {:.2?}  ✓", ver_elapsed);
+    let depth = aggregate_depth(pairs.len());
+    println!("\nverifying (depth={depth} LaBRADOR iterations)…");
+    let mut ver_progress = CliProgress::new(depth);
+    let ver_result = verify_with_progress(&pairs, &proof, &mut ver_progress);
+    let ver_elapsed = ver_progress.finish();
+    match ver_result {
+        Ok(()) => println!("verify:                  {:.2?}  ✓", ver_elapsed),
+        Err(e) => {
+            println!("verify:                  {:.2?}  ✗  ({e})", ver_elapsed);
+            std::process::exit(1);
+        }
+    }
 
     if labrador::stage_timing::is_enabled() {
         print_stage_table("verifier stage breakdown", labrador::stage_timing::drain());
