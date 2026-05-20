@@ -660,7 +660,10 @@ pub fn add_form_constraints_ep(
             }
         }
 
-        // Coef-0 ties at active R-positions, slots 0..3 only.
+        // Full σ₋₁ˢ tie of e' to e at active R-positions, plus pinning of e'
+        // outside the support of e. This makes the witness structurally rigid
+        // (e' = σ₋₁ˢ(e) coefficient-by-coefficient) rather than only at the
+        // four-square's required positions.
         for r_pos in 1..=layout.n_sigs {
             if layout.index_prime(r_pos) != i_yp {
                 continue;
@@ -668,8 +671,10 @@ pub fn add_form_constraints_ep(
             let i_y_partner = layout.index(r_pos);
             let evec = layout.e_idx(i_y_partner);
             let base = C * (r_pos - 1);
+
             for s in 0..4 {
                 let p = base + s;
+                // ct(e[p] − e'[p]) = 0 — c[0] tied.
                 stmt.const_term.push(ConstTermConstraint {
                     a: vec![],
                     phi: vec![
@@ -677,6 +682,25 @@ pub fn add_form_constraints_ep(
                         (epvec, vec![(p, neg_one.clone())]),
                     ],
                     b0: 0,
+                });
+                // c[l] = -e[p][d_S - l] for l ∈ [1, d_S − 1]. Since e[p][k] = 0
+                // for k ≥ 1 at active slots 0..3, this collapses to
+                // ct(X^{d_S − l} · e'[p]) = -e'[p][l] = 0.
+                for l in 1..D {
+                    let xdl = RingElem::monomial(m, D - l);
+                    stmt.const_term.push(ConstTermConstraint {
+                        a: vec![],
+                        phi: vec![(epvec, vec![(p, xdl)])],
+                        b0: 0,
+                    });
+                }
+            }
+            // Pin slots 4..7 of e' entirely to zero (matches e at these slots).
+            for s in 4..C {
+                stmt.full.push(DotConstraint {
+                    a: vec![],
+                    phi: vec![(epvec, vec![(base + s, one.clone())])],
+                    b: RingElem::zero(),
                 });
             }
         }
