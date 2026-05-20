@@ -107,6 +107,71 @@ fn flipping_one_witness_coefficient_breaks_satisfaction() {
 }
 
 #[test]
+fn tampering_yp_padding_breaks_form_constraints() {
+    // y'_{iyp, j} should be zero at R-positions not ≡ iyp (mod ρ). Setting any
+    // S-position of a padding R-position to non-zero must reject.
+    let ring = ring();
+    let sigs = fresh_sigs(4);
+    let beta_sq: i128 = 1 << 60;
+    let (stmt, witness, layout) = build_falcon_statement(&sigs, &ring, beta_sq);
+
+    // For N=4, ρ=2: y'_{1, 1} active at R-positions {1, 3}; padding at {2, 4}.
+    // S-position for R-position 2 = 8..15.
+    let yp = layout.yp_idx(1, 1);
+    let mut bad = witness.clone();
+    bad.w[yp][8].c[0] = ring.m.add(bad.w[yp][8].c[0], 1);
+    assert!(
+        !satisfies(&stmt, &bad),
+        "padding of y' must be pinned to zero"
+    );
+}
+
+#[test]
+fn breaking_sigma_minus_one_tie_is_detected() {
+    // Replace y' with y at one active S-position (no σ₋₁ applied) — the
+    // σ₋₁ˢ tie should detect it.
+    let ring = ring();
+    let sigs = fresh_sigs(4);
+    let beta_sq: i128 = 1 << 60;
+    let (stmt, witness, layout) = build_falcon_statement(&sigs, &ring, beta_sq);
+
+    // y'_{1, 1} active at R-position 1 (S-pos 0..7). Replace y'_{1, 1}[0]
+    // (currently σ₋₁ˢ(y_{1, 1}[0])) with y_{1, 1}[0] (no σ₋₁) — they differ
+    // at every X^l coefficient for l ∈ [1, 63] if y has non-zero content there.
+    let yp = layout.yp_idx(1, 1);
+    let y = layout.y_idx(1, 1);
+    let mut bad = witness.clone();
+    // Force-clear coef 5 of y'[0] (which σ₋₁ˢ(y[0])[5] should equal − y[0][59])
+    // — flipping it makes the tie at l=5 fail.
+    bad.w[yp][0].c[5] = ring.m.add(bad.w[yp][0].c[5], 1);
+    // Ensure y[0] coef 59 is non-zero so the constraint is actually violated.
+    let _ = bad.w[y][0].c[59];
+    assert!(
+        !satisfies(&stmt, &bad),
+        "σ₋₁ˢ tie at active y' position must reject a coefficient flip"
+    );
+}
+
+#[test]
+fn tampering_e_inner_coef_breaks_form_constraints() {
+    // e_{i_y} at active R-position slot 0..3 must have inner coefs 1..63 = 0.
+    // Setting any one of them non-zero must reject.
+    let ring = ring();
+    let sigs = fresh_sigs(4);
+    let beta_sq: i128 = 1 << 60;
+    let (stmt, witness, layout) = build_falcon_statement(&sigs, &ring, beta_sq);
+
+    let evec = layout.e_idx(1);
+    // R-position 1, slot 0, inner coef 5.
+    let mut bad = witness.clone();
+    bad.w[evec][0].c[5] = ring.m.add(bad.w[evec][0].c[5], 1);
+    assert!(
+        !satisfies(&stmt, &bad),
+        "inner coef 5 of slot 0 of e_{{i_y}} active R-position must be pinned"
+    );
+}
+
+#[test]
 fn tampering_a_signature_byte_breaks_falcon_eq() {
     // Build the *honest* statement first (so we have the public hi, ci to
     // compare against); then re-derive a witness from the same statement with

@@ -361,7 +361,6 @@ pub fn add_falcon_eq_constraints(
     let m = &ring.m;
     let q = FALCON_Q as u64;
     let y_mono = RingElem::monomial(m, 1);
-    let n_s = layout.n_s();
 
     for (sig_idx, sig) in sigs.iter().enumerate() {
         let i = sig_idx + 1;
@@ -376,20 +375,18 @@ pub fn add_falcon_eq_constraints(
         let v = layout.v_idx();
 
         for k in 0..C {
-            let mut phi_y1 = vec![RingElem::zero(); n_s];
-            let mut phi_y2 = vec![RingElem::zero(); n_s];
-            let mut phi_v = vec![RingElem::zero(); n_s];
-
-            phi_y1[pos + k] = RingElem::constant(m, 1);
-            phi_v[pos + k] = RingElem::constant(m, q);
-
+            let phi_y1 = vec![(pos + k, RingElem::constant(m, 1))];
+            let phi_v = vec![(pos + k, RingElem::constant(m, q))];
+            let mut phi_y2: Vec<(usize, RingElem)> = Vec::with_capacity(C);
             for b in 0..C {
                 let coef = if b <= k {
                     h_slots[k - b].clone()
                 } else {
                     ring.mul(&y_mono, &h_slots[k + C - b])
                 };
-                phi_y2[pos + b] = coef;
+                if !coef.is_zero() {
+                    phi_y2.push((pos + b, coef));
+                }
             }
 
             stmt.full.push(DotConstraint {
@@ -442,12 +439,254 @@ pub fn add_four_square_constraints(
     }
 }
 
+/// Append §F.2 *padding* form constraints for the `y_{iy, j}` vectors.
+///
+/// `ȳ_{iy, j}` is non-zero only at R-positions `[(iy−1)·ρ + 1, iy·ρ] ∩ [1, N]`.
+/// In the S-encoding each R-position spans 8 S-positions, so we pin every
+/// S-position outside the active range to the zero S-element with a full
+/// `DotConstraint` of the shape `w_{y_idx}[p] = 0`.
+pub fn add_form_constraints_y_padding(
+    stmt: &mut Statement,
+    layout: &WitnessLayout,
+    ring: &Ring,
+) {
+    let m = &ring.m;
+    let one = RingElem::constant(m, 1);
+    let zero_b = RingElem::zero();
+    for i_y in 1..=layout.num_y {
+        let active_lo = (i_y - 1) * layout.rho + 1;
+        let active_hi = (i_y * layout.rho).min(layout.n_sigs);
+        for j in 1..=2 {
+            let yvec = layout.y_idx(i_y, j);
+            for r_pos in 1..=layout.n_sigs {
+                if r_pos >= active_lo && r_pos <= active_hi {
+                    continue;
+                }
+                let base = C * (r_pos - 1);
+                for s in 0..C {
+                    stmt.full.push(DotConstraint {
+                        a: vec![],
+                        phi: vec![(yvec, vec![(base + s, one.clone())])],
+                        b: zero_b.clone(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Append §F.2 form constraints for the `y'_{iyp, j}` vectors:
+/// (i) pin every padding S-position to zero, and (ii) tie `y'[p] = σ₋₁ˢ(y[p])`
+/// at every active S-position `p`.
+///
+/// `ȳ'_{iyp, j}` is non-zero only at R-positions `k` with `k ≡ iyp (mod ρ)`.
+/// At each such R-position `k`, the *honest* witness has
+/// `y'[8(k−1) + s] = σ₋₁ˢ(y_{index(k), j}[8(k−1) + s])` for every slot `s`.
+/// We enforce this with `d_S = 64` constant-term constraints per S-position:
+///
+/// ```text
+/// ct(y[p] − y'[p]) = 0
+/// ct(X^l · y[p] + X^{d_S − l} · y'[p]) = 0,   l ∈ [1, d_S − 1]
+/// ```
+///
+/// (See the derivation in module-level rustdoc: `ct(X^l · a)` exposes
+/// coefficient `−a[d_S − l]`, so the second family pins
+/// `y'[p][l] = −y[p][d_S − l]`.)
+pub fn add_form_constraints_yp(
+    stmt: &mut Statement,
+    layout: &WitnessLayout,
+    ring: &Ring,
+) {
+    let m = &ring.m;
+    let one = RingElem::constant(m, 1);
+    let neg_one = RingElem::constant(m, m.neg(1));
+
+    for i_yp in 1..=layout.num_yp {
+        for j in 1..=2 {
+            let ypvec = layout.yp_idx(i_yp, j);
+
+            // Padding pins: r_pos NOT ≡ i_yp (mod ρ).
+            for r_pos in 1..=layout.n_sigs {
+                if layout.index_prime(r_pos) == i_yp {
+                    continue;
+                }
+                let base = C * (r_pos - 1);
+                for s in 0..C {
+                    stmt.full.push(DotConstraint {
+                        a: vec![],
+                        phi: vec![(ypvec, vec![(base + s, one.clone())])],
+                        b: RingElem::zero(),
+                    });
+                }
+            }
+
+            // σ₋₁ˢ ties at active S-positions: r_pos ≡ i_yp (mod ρ).
+            for r_pos in 1..=layout.n_sigs {
+                if layout.index_prime(r_pos) != i_yp {
+                    continue;
+                }
+                let i_y_partner = layout.index(r_pos);
+                let yvec = layout.y_idx(i_y_partner, j);
+                let base = C * (r_pos - 1);
+                for s in 0..C {
+                    let p = base + s;
+                    // ct(y[p] - y'[p]) = 0
+                    stmt.const_term.push(ConstTermConstraint {
+                        a: vec![],
+                        phi: vec![
+                            (yvec, vec![(p, one.clone())]),
+                            (ypvec, vec![(p, neg_one.clone())]),
+                        ],
+                        b0: 0,
+                    });
+                    // ct(X^l · y[p] + X^{d_S - l} · y'[p]) = 0  for l in [1, d_S − 1]
+                    for l in 1..D {
+                        let xl = RingElem::monomial(m, l);
+                        let xdl = RingElem::monomial(m, D - l);
+                        stmt.const_term.push(ConstTermConstraint {
+                            a: vec![],
+                            phi: vec![
+                                (yvec, vec![(p, xl)]),
+                                (ypvec, vec![(p, xdl)]),
+                            ],
+                            b0: 0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Append §F.2 form constraints for the `eᵢ` vectors.
+///
+/// The honest `eᵢ` carries ε₀..ε₃ from Lagrange's four-square at *slots 0..3*
+/// (each slot's *constant term*, since `embed_signed` puts R-coefficient `r`
+/// into slot `r mod 8`, inner-coefficient `r / 8`, and ε is supported on
+/// R-coefficients 0..3). Slots 4..7 are entirely zero. We enforce:
+///
+/// - Padding R-positions: pin every S-position to zero.
+/// - Active R-position `r_pos`: pin slots 4..7 to zero (full constraints),
+///   and pin inner coefficients 1..d_S − 1 of slots 0..3 to zero
+///   (constant-term constraints via `ct(X^{d_S − k} · e[p]) = −e[p][k]`).
+pub fn add_form_constraints_e(
+    stmt: &mut Statement,
+    layout: &WitnessLayout,
+    ring: &Ring,
+) {
+    let m = &ring.m;
+    let one = RingElem::constant(m, 1);
+
+    for i_y in 1..=layout.num_y {
+        let active_lo = (i_y - 1) * layout.rho + 1;
+        let active_hi = (i_y * layout.rho).min(layout.n_sigs);
+        let evec = layout.e_idx(i_y);
+
+        for r_pos in 1..=layout.n_sigs {
+            let base = C * (r_pos - 1);
+            if r_pos < active_lo || r_pos > active_hi {
+                // padding: pin all 8 slots
+                for s in 0..C {
+                    stmt.full.push(DotConstraint {
+                        a: vec![],
+                        phi: vec![(evec, vec![(base + s, one.clone())])],
+                        b: RingElem::zero(),
+                    });
+                }
+            } else {
+                // active R-position: pin slots 4..7 entirely
+                for s in 4..C {
+                    stmt.full.push(DotConstraint {
+                        a: vec![],
+                        phi: vec![(evec, vec![(base + s, one.clone())])],
+                        b: RingElem::zero(),
+                    });
+                }
+                // active slots 0..3: pin inner coefficients 1..d_S − 1.
+                for s in 0..4 {
+                    let p = base + s;
+                    for k in 1..D {
+                        let monomial = RingElem::monomial(m, D - k);
+                        stmt.const_term.push(ConstTermConstraint {
+                            a: vec![],
+                            phi: vec![(evec, vec![(p, monomial)])],
+                            b0: 0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Append §F.2 form constraints for the `e'ᵢ` vectors.
+///
+/// The honest `e'ᵢ` is `σ₋₁ˢ(eᵢ)` slot-wise. Since `eᵢ` is constrained to be
+/// the constant `ε_s` at slot `s ∈ [0, 3]` (and zero elsewhere), and
+/// `σ₋₁ˢ(constant) = constant`, the honest `e'` mirrors `e` at slots 0..3
+/// inner coefficient 0. We enforce only the four coef-0 ties: this is enough
+/// for the four-square because `e` is already pinned to zero at every other
+/// position, so any extra content in `e'` cannot enter the constant-term
+/// inner product `ct(⟨e, e'⟩)` (paper §F.2: "it is enough to check that they
+/// are 0 in ē_i").
+///
+/// - Padding R-positions: pin all 8 S-slots of `e'` to zero.
+/// - Active R-position, slots 0..3: tie `ct(e[p] − e'[p]) = 0`. That's a
+///   single constant-term constraint per slot.
+pub fn add_form_constraints_ep(
+    stmt: &mut Statement,
+    layout: &WitnessLayout,
+    ring: &Ring,
+) {
+    let m = &ring.m;
+    let one = RingElem::constant(m, 1);
+    let neg_one = RingElem::constant(m, m.neg(1));
+
+    for i_yp in 1..=layout.num_yp {
+        let epvec = layout.ep_idx(i_yp);
+
+        // Padding pins.
+        for r_pos in 1..=layout.n_sigs {
+            if layout.index_prime(r_pos) == i_yp {
+                continue;
+            }
+            let base = C * (r_pos - 1);
+            for s in 0..C {
+                stmt.full.push(DotConstraint {
+                    a: vec![],
+                    phi: vec![(epvec, vec![(base + s, one.clone())])],
+                    b: RingElem::zero(),
+                });
+            }
+        }
+
+        // Coef-0 ties at active R-positions, slots 0..3 only.
+        for r_pos in 1..=layout.n_sigs {
+            if layout.index_prime(r_pos) != i_yp {
+                continue;
+            }
+            let i_y_partner = layout.index(r_pos);
+            let evec = layout.e_idx(i_y_partner);
+            let base = C * (r_pos - 1);
+            for s in 0..4 {
+                let p = base + s;
+                stmt.const_term.push(ConstTermConstraint {
+                    a: vec![],
+                    phi: vec![
+                        (evec, vec![(p, one.clone())]),
+                        (epvec, vec![(p, neg_one.clone())]),
+                    ],
+                    b0: 0,
+                });
+            }
+        }
+    }
+}
+
 /// Build the LaBRADOR statement, honest witness, and layout for an aggregation
 /// of `N` decoded Falcon-512 signatures.
 ///
-/// `beta_sq` is the global ℓ²-norm bound on the entire padded witness — set
-/// generously for Phase 3c (a tight bound comes with the §F.2 form constraints
-/// and the §6.2 quotient-norm analysis in a later phase).
+/// `beta_sq` is the global ℓ²-norm bound on the entire padded witness.
 pub fn build_falcon_statement(
     sigs: &[FalconSig],
     ring: &Ring,
@@ -464,6 +703,10 @@ pub fn build_falcon_statement(
     };
     add_falcon_eq_constraints(&mut stmt, &layout, sigs, ring);
     add_four_square_constraints(&mut stmt, &layout, FALCON_BETA_SQ, ring);
+    add_form_constraints_y_padding(&mut stmt, &layout, ring);
+    add_form_constraints_yp(&mut stmt, &layout, ring);
+    add_form_constraints_e(&mut stmt, &layout, ring);
+    add_form_constraints_ep(&mut stmt, &layout, ring);
     (stmt, witness, layout)
 }
 
