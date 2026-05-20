@@ -13,19 +13,27 @@
 //! the reference repo targets a deeper splitting and is deliberately unused.)
 
 use crate::modulus::Modulus;
+use crate::ntt::{mul_ntt, NttTables};
 use crate::poly::{RingElem, D};
 
 /// Half-degree of each CRT factor.
 pub const H: usize = D / 2; // 32
 
-/// The LaBRADOR ring together with the constant `r = sqrt(-1)` that drives
-/// the two-splitting CRT.
+/// The LaBRADOR ring together with either:
+/// - precomputed NTT twiddles (when `q ≡ 1 mod 2D`, the fast production path),
+///   used by [`Ring::mul`] for a full radix-2 negacyclic NTT, or
+/// - the constant `r = sqrt(-1)` driving the 2-splitting CRT (when only
+///   `q ≡ 1 mod 4` and not `q ≡ 1 mod 2D`, the back-compat path for tests
+///   using `find_prime_5mod8`).
 #[derive(Clone, Copy, Debug)]
 pub struct Ring {
     /// Coefficient field.
     pub m: Modulus,
-    /// A fixed square root of `-1` mod `q`.
+    /// A fixed square root of `-1` mod `q`. Always available because every
+    /// supported modulus satisfies `q ≡ 1 (mod 4)`.
     pub r: u64,
+    /// NTT twiddle tables, available exactly when `q ≡ 1 (mod 2D)`.
+    pub ntt: Option<NttTables>,
 }
 
 /// CRT representation of a ring element: residues modulo each factor.
@@ -38,13 +46,21 @@ pub struct CrtRepr {
 }
 
 impl Ring {
-    /// Build the ring context for modulus `m`, computing `r = sqrt(-1)`.
+    /// Build the ring context for modulus `m`. If `q ≡ 1 (mod 2D)`, also
+    /// precomputes NTT twiddles so [`Ring::mul`] uses the fast NTT path.
     /// Panics if `q ≢ 1 (mod 4)` (no square root of `-1`).
     pub fn new(m: Modulus) -> Self {
         let r = m
             .sqrt_minus_one()
             .expect("q must be 1 mod 4 for the two-splitting ring");
-        Ring { m, r }
+        let two_d = (2 * D) as u64;
+        let ntt = if (m.q - 1) % two_d == 0 {
+            let psi = m.primitive_root_of_unity(two_d);
+            Some(NttTables::from_psi(&m, psi))
+        } else {
+            None
+        };
+        Ring { m, r, ntt }
     }
 
     /// Map a ring element to its CRT residues.
@@ -103,11 +119,17 @@ impl Ring {
         out
     }
 
-    /// Multiply two ring elements via the CRT path.
+    /// Multiply two ring elements.
     ///
-    /// Must agree with [`RingElem::mul`] — this is the central invariant
-    /// guarding the two-splitting decomposition.
+    /// Uses the NTT path when `Ring::new` was able to compute twiddles
+    /// (i.e. `q ≡ 1 mod 2D`); otherwise falls back to the 2-splitting CRT.
+    /// Both must agree with [`RingElem::mul`] — this is the central invariant
+    /// guarding the decomposition.
     pub fn mul(&self, a: &RingElem, b: &RingElem) -> RingElem {
+        if let Some(t) = self.ntt.as_ref() {
+            let c = mul_ntt(&self.m, &a.c, &b.c, t);
+            return RingElem { c };
+        }
         let ca = self.split(a);
         let cb = self.split(b);
         let neg_r = self.m.neg(self.r);

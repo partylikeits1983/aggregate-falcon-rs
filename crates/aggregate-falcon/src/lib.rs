@@ -93,15 +93,6 @@ impl std::fmt::Display for VerifyError {
 
 impl std::error::Error for VerifyError {}
 
-/// Generous β² bound for the initial statement. The form constraints already
-/// pin the witness structure; this bound just needs to be loose enough that
-/// the deeply-folded chunks pass the per-iteration norm check. Session E will
-/// tighten this to the paper-correct `Params::for_n(N).beta_init_sq()` once
-/// rejection sampling lands.
-fn select_beta_sq() -> i128 {
-    1i128 << 60
-}
-
 pub fn aggregate(sigs: &[FalconInstance]) -> Result<AggregateProof, AggregateError> {
     if sigs.is_empty() {
         return Err(AggregateError::EmptyInput);
@@ -121,7 +112,7 @@ pub fn aggregate(sigs: &[FalconInstance]) -> Result<AggregateProof, AggregateErr
         parsed.push(p);
     }
 
-    let beta_sq = select_beta_sq();
+    let beta_sq = params.beta_init_sq();
     let (statement, witness, _layout) = build_falcon_statement(&parsed, &ring, beta_sq);
 
     let labrador = prove_aggregate(&statement, &witness, &params, TRANSCRIPT_DOMAIN);

@@ -7,17 +7,24 @@
 
 use crate::statement::{ring_inner_product, sparse_phi_inner_product};
 use modring::{Modulus, Ring, RingElem, D};
+use rayon::prelude::*;
 
 /// Upper-triangular `g_{ij} = ⟨w_i, w_j⟩` for `i ≤ j`. Returned as a
 /// `Vec<Vec<RingElem>>` of shape `[r][r]` with the lower triangle left as
 /// `RingElem::zero()` (caller fills via symmetry if needed).
 pub fn compute_g(ring: &Ring, ws: &[Vec<RingElem>]) -> Vec<Vec<RingElem>> {
     let r = ws.len();
+    // r(r+1)/2 upper-triangle inner products, all independent.
+    let pairs: Vec<(usize, usize)> = (0..r)
+        .flat_map(|i| (i..r).map(move |j| (i, j)))
+        .collect();
+    let entries: Vec<(usize, usize, RingElem)> = pairs
+        .par_iter()
+        .map(|&(i, j)| (i, j, ring_inner_product(ring, &ws[i], &ws[j])))
+        .collect();
     let mut g = vec![vec![RingElem::zero(); r]; r];
-    for i in 0..r {
-        for j in i..r {
-            g[i][j] = ring_inner_product(ring, &ws[i], &ws[j]);
-        }
+    for (i, j, v) in entries {
+        g[i][j] = v;
     }
     g
 }
@@ -32,14 +39,21 @@ pub fn compute_h(
     let m = &ring.m;
     let r = ws.len();
     let inv2 = m.inv(2);
-    let mut h = vec![vec![RingElem::zero(); r]; r];
-    for i in 0..r {
-        for j in i..r {
+    let pairs: Vec<(usize, usize)> = (0..r)
+        .flat_map(|i| (i..r).map(move |j| (i, j)))
+        .collect();
+    let entries: Vec<(usize, usize, RingElem)> = pairs
+        .par_iter()
+        .map(|&(i, j)| {
             let a = sparse_phi_inner_product(ring, &phis[i], &ws[j]);
             let b = sparse_phi_inner_product(ring, &phis[j], &ws[i]);
             let sum = a.add(m, &b);
-            h[i][j] = sum.scale(m, inv2);
-        }
+            (i, j, sum.scale(m, inv2))
+        })
+        .collect();
+    let mut h = vec![vec![RingElem::zero(); r]; r];
+    for (i, j, v) in entries {
+        h[i][j] = v;
     }
     h
 }

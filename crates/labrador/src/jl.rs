@@ -8,17 +8,14 @@
 use crate::statement::ConstTermConstraint;
 use crate::transcript::Transcript;
 use modring::{Modulus, RingElem, D};
+use rayon::prelude::*;
 
 pub const LAMBDA: usize = 128;
 pub const PROJECTION_ROWS: usize = 2 * LAMBDA; // 256
 
-/// Sample one row of Π (length `cols`) into a sparse `(position, ±1)` list.
-/// The 50/25/25 distribution is implemented by drawing two bits and using
-/// `(bit0, bit1)` as `(zero?, sign)`.
-fn sample_pi_row(t: &mut Transcript, label: &[u8], cols: usize) -> Vec<(usize, i8)> {
-    // Pack two bits per coordinate: zero/non-zero (bit0), sign if non-zero (bit1).
-    let nbytes = (cols + 3) / 4; // 4 entries per byte
-    let bytes = t.challenge_bytes(label, nbytes);
+/// Parse a sparse Π row (length `cols`) from `cols/4` bytes already drawn
+/// from the transcript. 2 bits per coordinate: `(bit0=zero?, bit1=sign)`.
+fn parse_pi_row(bytes: &[u8], cols: usize) -> Vec<(usize, i8)> {
     let mut out = Vec::new();
     for k in 0..cols {
         let byte = bytes[k / 4];
@@ -34,15 +31,25 @@ fn sample_pi_row(t: &mut Transcript, label: &[u8], cols: usize) -> Vec<(usize, i
 }
 
 /// Sample the full projection matrix `Π` as `PROJECTION_ROWS` sparse rows.
+///
+/// All 256 rows are drawn from a single SHAKE squeeze of
+/// `PROJECTION_ROWS · ⌈cols/4⌉` bytes, then split per-row in parallel. This
+/// replaces the previous 256 individual `challenge_bytes` calls per
+/// projection (one per row) and parses the rows on all cores; the call was a
+/// top wall-clock hotspot in the v2 prover and the fold replay
+/// (~150–400 ms per call serially).
 pub fn sample_projection(
     t: &mut Transcript,
     label: &[u8],
     cols: usize,
 ) -> Vec<Vec<(usize, i8)>> {
+    let nbytes_per_row = (cols + 3) / 4;
+    let bytes = t.challenge_bytes(label, nbytes_per_row * PROJECTION_ROWS);
     (0..PROJECTION_ROWS)
+        .into_par_iter()
         .map(|j| {
-            let row_label = [label, b"|row|", &(j as u64).to_le_bytes()].concat();
-            sample_pi_row(t, &row_label, cols)
+            let s = j * nbytes_per_row;
+            parse_pi_row(&bytes[s..s + nbytes_per_row], cols)
         })
         .collect()
 }
@@ -55,20 +62,27 @@ pub fn project_vector(
     w: &[RingElem],
     m: &Modulus,
 ) -> [i128; PROJECTION_ROWS] {
-    let mut out = [0i128; PROJECTION_ROWS];
-    // Flatten centered coefficients of w.
+    // Flatten centered coefficients of w. The flatten cost is O(n·D) and
+    // sequential here; the 256-row reduction below dominates.
     let mut wflat: Vec<i64> = Vec::with_capacity(w.len() * D);
     for e in w {
         for k in 0..D {
             wflat.push(m.centered(e.c[k]));
         }
     }
-    for (j, row) in pi.iter().enumerate() {
-        let mut acc: i128 = 0;
-        for &(pos, sign) in row {
-            acc += (sign as i128) * (wflat[pos] as i128);
-        }
-        out[j] = acc;
+    let row_results: Vec<i128> = pi
+        .par_iter()
+        .map(|row| {
+            let mut acc: i128 = 0;
+            for &(pos, sign) in row {
+                acc += (sign as i128) * (wflat[pos] as i128);
+            }
+            acc
+        })
+        .collect();
+    let mut out = [0i128; PROJECTION_ROWS];
+    for (j, v) in row_results.into_iter().enumerate() {
+        out[j] = v;
     }
     out
 }
@@ -152,14 +166,27 @@ pub fn project_combined(
     ws: &[Vec<RingElem>],
     m: &Modulus,
 ) -> [i128; PROJECTION_ROWS] {
-    let mut out = [0i128; PROJECTION_ROWS];
-    for (pi, w) in pis.iter().zip(ws.iter()) {
-        let p = project_vector(pi, w, m);
-        for j in 0..PROJECTION_ROWS {
-            out[j] += p[j];
-        }
-    }
-    out
+    pis.par_iter()
+        .zip(ws.par_iter())
+        .fold(
+            || [0i128; PROJECTION_ROWS],
+            |mut acc, (pi, w)| {
+                let p = project_vector(pi, w, m);
+                for j in 0..PROJECTION_ROWS {
+                    acc[j] += p[j];
+                }
+                acc
+            },
+        )
+        .reduce(
+            || [0i128; PROJECTION_ROWS],
+            |mut a, b| {
+                for j in 0..PROJECTION_ROWS {
+                    a[j] += b[j];
+                }
+                a
+            },
+        )
 }
 
 #[cfg(test)]
@@ -200,7 +227,9 @@ mod tests {
     fn distribution_is_approximately_50_25_25() {
         let mut t = Transcript::new(b"jl-dist");
         let cols = 10_000;
-        let row = sample_pi_row(&mut t, b"r0", cols);
+        let nbytes = (cols + 3) / 4;
+        let bytes = t.challenge_bytes(b"r0", nbytes);
+        let row = parse_pi_row(&bytes, cols);
         let total = row.len();
         let pos = row.iter().filter(|(_, s)| *s == 1).count();
         let neg = row.iter().filter(|(_, s)| *s == -1).count();

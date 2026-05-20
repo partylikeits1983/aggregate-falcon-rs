@@ -13,9 +13,12 @@
 
 pub mod crt;
 pub mod modulus;
+pub mod ntt;
 pub mod poly;
 pub mod rng;
 
 pub use crt::{CrtRepr, Ring, H};
-pub use modulus::{find_prime_5mod8, find_prime_5mod8_below, is_prime, Modulus};
+pub use modulus::{
+    find_prime_5mod8, find_prime_5mod8_below, find_prime_ntt_friendly_below, is_prime, Modulus,
+};
 pub use poly::{RingElem, D};

@@ -126,6 +126,26 @@ impl RingElem {
         r
     }
 
+    /// `self += other * s` (mod q). In-place version that skips both the
+    /// `other.scale(m, s)` and `self.add(m, &scaled)` allocations — used in the
+    /// F'-aggregation hot loop in the prover and fold, which iterates
+    /// O(k_pp · n_fp · |c.a|) times and previously dominated wall-clock.
+    #[inline]
+    pub fn add_scaled_assign(&mut self, m: &Modulus, other: &RingElem, s: u64) {
+        for i in 0..D {
+            let p = m.mul(other.c[i], s);
+            self.c[i] = m.add(self.c[i], p);
+        }
+    }
+
+    /// In-place coefficient-wise sum: `self += other`.
+    #[inline]
+    pub fn add_assign(&mut self, m: &Modulus, other: &RingElem) {
+        for i in 0..D {
+            self.c[i] = m.add(self.c[i], other.c[i]);
+        }
+    }
+
     /// Negacyclic schoolbook product in `R_Q` (the reference multiplication).
     ///
     /// For `i + j >= 64` the term wraps with a sign flip, since `X^64 = -1`.

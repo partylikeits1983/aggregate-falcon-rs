@@ -132,13 +132,15 @@ impl Params {
 
     /// Choose the LaBRADOR ring modulus `q'` for this `N`.
     ///
-    /// Returns the largest prime `≡ 5 (mod 8)` strictly below `2^q_bitlen`,
-    /// which guarantees each iteration's centered base-`b₁`/`b₂` decomposition
-    /// satisfies `b^t ≥ 2^q_bitlen > q'` — lossless, as required for the
-    /// recursion's fold to express `v_i = Σ_l b₁^l · v_i^(l)` as a linear
-    /// constraint over the new witness.
+    /// Returns the largest prime `≡ 1 (mod 2D)` strictly below `2^q_bitlen`.
+    /// The `≡ 1 (mod 2D)` constraint makes `F_{q'}` admit a primitive `2D`-th
+    /// root of unity, enabling the negacyclic NTT path used by [`Ring::mul`].
+    /// The `< 2^q_bitlen` constraint still guarantees each iteration's
+    /// centered base-`b₁`/`b₂` decomposition is lossless (`b^t ≥ 2^q_bitlen >
+    /// q'`), which the recursion's fold relies on.
     pub fn select_modulus(&self) -> u64 {
-        modring::find_prime_5mod8_below(1u64 << self.q_bitlen)
+        let two_d = 2 * modring::D as u64;
+        modring::find_prime_ntt_friendly_below(1u64 << self.q_bitlen, two_d)
     }
 
     /// Paper-correct initial norm bound `β² = β_init²`.

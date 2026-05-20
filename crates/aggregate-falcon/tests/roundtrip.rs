@@ -78,3 +78,44 @@ fn serde_roundtrip_then_verify() {
     let restored: AggregateProof = bincode::deserialize(&bytes).expect("deserialize");
     verify(&pairs, &restored).expect("verify after bincode round-trip");
 }
+
+/// One-shot end-to-end check at N=8: real Falcon-512 keygen + sign, real
+/// aggregate, honest verify, every tamper-mutation rejected, bincode round
+/// trip still verifies. This is the "is the aggregator alive" signal for
+/// CI; the split tests above are kept for granular failure messages.
+#[test]
+fn roundtrip_n8_full_adversarial() {
+    let (sigs, pairs) = make_sigs(8);
+    let proof = aggregate(&sigs).expect("aggregate must succeed");
+
+    // Honest path: accept.
+    verify(&pairs, &proof).expect("honest verify must accept");
+
+    // Tamper 1: substitute a fresh public key.
+    {
+        let (other_pk, _) = falcon512::keypair();
+        let mut tampered = pairs.clone();
+        tampered[3].0 = other_pk.as_bytes().to_vec();
+        assert!(verify(&tampered, &proof).is_err(), "wrong pk must reject");
+    }
+
+    // Tamper 2: mutate a message.
+    {
+        let mut tampered = pairs.clone();
+        tampered[5].1.push(0xff);
+        assert!(verify(&tampered, &proof).is_err(), "wrong message must reject");
+    }
+
+    // Tamper 3: flip a coefficient inside the proof's final opening.
+    {
+        let mut bad_proof = proof.clone();
+        let last = bad_proof.labrador.final_iter.last_msg.as_mut().unwrap();
+        last.z0[0].c[0] ^= 1;
+        assert!(verify(&pairs, &bad_proof).is_err(), "flipped proof byte must reject");
+    }
+
+    // Bincode round-trip preserves verification.
+    let bytes = bincode::serialize(&proof).expect("serialize");
+    let restored: AggregateProof = bincode::deserialize(&bytes).expect("deserialize");
+    verify(&pairs, &restored).expect("verify after bincode round-trip");
+}

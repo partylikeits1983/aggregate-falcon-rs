@@ -180,40 +180,52 @@ pub fn verify_v2(
     absorb_ring_vec(transcript, LABEL_BPP, &proof.b_double_prime);
 
     // --- Step 4 mirror: rebuild (a_pp, phi_pp), aggregate F + F'', commit u_2 ---
-    let mut a_pp: Vec<Vec<Vec<RingElem>>> = vec![vec![vec![RingElem::zero(); r]; r]; k_pp];
-    let mut phi_pp: Vec<Vec<Vec<(usize, RingElem)>>> = vec![vec![vec![]; r]; k_pp];
-    for k in 0..k_pp {
-        for (l, c) in const_term_extended.iter().enumerate() {
-            let psi = psis[k][l];
-            if psi == 0 {
-                continue;
-            }
-            for &(i, j, ref aij) in &c.a {
-                let scaled = aij.scale(m, psi);
-                a_pp[k][i][j] = a_pp[k][i][j].add(m, &scaled);
-            }
-            for (wi, phi_i) in &c.phi {
-                let bucket = &mut phi_pp[k][*wi];
-                for (pos, coef) in phi_i {
-                    let scaled = coef.scale(m, psi);
-                    bucket.push((*pos, scaled));
+    // Same dense-Option accumulator pattern as prover_v2 / fold — see those
+    // for the rationale. Parallelise over k so the verifier scales with cores.
+    use rayon::prelude::*;
+    let per_k_pairs: Vec<(Vec<Vec<RingElem>>, Vec<Vec<(usize, RingElem)>>)> = (0..k_pp)
+        .into_par_iter()
+        .map(|k| {
+            let mut a_pp_k: Vec<Vec<RingElem>> = vec![vec![RingElem::zero(); r]; r];
+            let mut phi_dense: Vec<Vec<Option<RingElem>>> = (0..r)
+                .map(|_| (0..n).map(|_| None).collect())
+                .collect();
+            for (l, c) in const_term_extended.iter().enumerate() {
+                let psi = psis[k][l];
+                if psi == 0 {
+                    continue;
                 }
-            }
-        }
-        for bucket in phi_pp[k].iter_mut() {
-            bucket.sort_by_key(|(p, _)| *p);
-            let mut merged: Vec<(usize, RingElem)> = Vec::with_capacity(bucket.len());
-            for (pos, coef) in bucket.drain(..) {
-                if let Some(last) = merged.last_mut() {
-                    if last.0 == pos {
-                        last.1 = last.1.add(m, &coef);
-                        continue;
+                for &(i, j, ref aij) in &c.a {
+                    a_pp_k[i][j].add_scaled_assign(m, aij, psi);
+                }
+                for (wi, phi_i) in &c.phi {
+                    let bucket = &mut phi_dense[*wi];
+                    for (pos, coef) in phi_i {
+                        match &mut bucket[*pos] {
+                            Some(existing) => existing.add_scaled_assign(m, coef, psi),
+                            slot @ None => *slot = Some(coef.scale(m, psi)),
+                        }
                     }
                 }
-                merged.push((pos, coef));
             }
-            *bucket = merged;
-        }
+            let phi_pp_k: Vec<Vec<(usize, RingElem)>> = phi_dense
+                .into_iter()
+                .map(|bucket| {
+                    bucket
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(p, opt)| opt.map(|coef| (p, coef)))
+                        .collect()
+                })
+                .collect();
+            (a_pp_k, phi_pp_k)
+        })
+        .collect();
+    let mut a_pp: Vec<Vec<Vec<RingElem>>> = Vec::with_capacity(k_pp);
+    let mut phi_pp: Vec<Vec<Vec<(usize, RingElem)>>> = Vec::with_capacity(k_pp);
+    for (a_k, phi_k) in per_k_pairs {
+        a_pp.push(a_k);
+        phi_pp.push(phi_k);
     }
 
     let alphas: Vec<RingElem> = (0..stmt.full.len())
@@ -408,10 +420,13 @@ fn absorb_p_vec(t: &mut Transcript, label: &[u8], v: &[i128]) {
 }
 
 fn sample_ring_element(t: &mut Transcript, label: &[u8], idx: u64, ring: &Ring) -> RingElem {
+    // Mirror prover_v2 / fold's single-squeeze form so all three sides keep
+    // the transcript in lock-step.
+    let sub = [label, &idx.to_le_bytes()].concat();
+    let coeffs = t.derive_field_array(&sub, D, ring.m.q);
     let mut e = RingElem::zero();
-    for k in 0..D {
-        let sub = [label, &idx.to_le_bytes(), &(k as u64).to_le_bytes()].concat();
-        e.c[k] = t.derive_below(&sub, ring.m.q);
+    for (k, v) in coeffs.into_iter().enumerate() {
+        e.c[k] = v;
     }
     e
 }

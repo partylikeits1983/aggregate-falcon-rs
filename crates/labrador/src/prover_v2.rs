@@ -24,9 +24,10 @@ use crate::jl::{build_jl_constraints, project_combined, sample_projection, PROJE
 use crate::params::Iteration;
 use crate::proof::{IterationLastMsg, IterationProofV2};
 use crate::prover::{aggregate_full, bind_statement, k_double_prime};
-use crate::statement::{ring_inner_product, sparse_phi_inner_product, Statement, Witness};
+use crate::statement::{sparse_phi_inner_product, Statement, Witness};
 use crate::transcript::Transcript;
 use modring::{RingElem, D};
+use rayon::prelude::*;
 
 const LABEL_A: &[u8] = b"labrador.A";
 const LABEL_B: &[u8] = b"labrador.B";
@@ -71,26 +72,33 @@ pub fn prove_v2(
     let v = commit_inner(ring, &a_mat, &witness.w);
 
     // Decompose each v_i (length κ) into t1 chunks base b1.
-    // v_chunks[i][k] = the k-th chunk of v_i, shape [κ].
-    let mut v_chunks: Vec<Vec<Vec<RingElem>>> = Vec::with_capacity(r);
-    for vi in v.iter() {
-        let mut per_i: Vec<Vec<RingElem>> = vec![vec![RingElem::zero(); kappa]; t1];
-        for (idx, e) in vi.iter().enumerate() {
-            let chunks = decompose(e, m, b1, t1);
-            for k in 0..t1 {
-                per_i[k][idx] = chunks[k].clone();
+    // v_chunks[i][k] = the k-th chunk of v_i, shape [κ]. Per-`i` independent.
+    let v_chunks: Vec<Vec<Vec<RingElem>>> = v
+        .par_iter()
+        .map(|vi| {
+            let mut per_i: Vec<Vec<RingElem>> = vec![vec![RingElem::zero(); kappa]; t1];
+            for (idx, e) in vi.iter().enumerate() {
+                let chunks = decompose(e, m, b1, t1);
+                for k in 0..t1 {
+                    per_i[k][idx] = chunks[k].clone();
+                }
             }
-        }
-        v_chunks.push(per_i);
-    }
+            per_i
+        })
+        .collect();
 
     // g_{ij} = ⟨w_i, w_j⟩ upper-triangular, decompose into t2 chunks base b2.
     let g = compute_g(ring, &witness.w);
+    let g_pairs: Vec<(usize, usize)> = (0..r)
+        .flat_map(|i| (i..r).map(move |j| (i, j)))
+        .collect();
+    let g_chunk_entries: Vec<(usize, usize, Vec<RingElem>)> = g_pairs
+        .par_iter()
+        .map(|&(i, j)| (i, j, decompose(&g[i][j], m, b2, t2)))
+        .collect();
     let mut g_chunks: Vec<Vec<Vec<RingElem>>> = vec![vec![vec![]; r]; r];
-    for i in 0..r {
-        for j in i..r {
-            g_chunks[i][j] = decompose(&g[i][j], m, b2, t2);
-        }
+    for (i, j, chunks) in g_chunk_entries {
+        g_chunks[i][j] = chunks;
     }
 
     let b_mats = expand_b_mats(transcript, LABEL_B, r, t1, kappa1, kappa, ring);
@@ -139,65 +147,85 @@ pub fn prove_v2(
         })
         .collect();
 
-    let mut a_pp: Vec<Vec<Vec<RingElem>>> = vec![vec![vec![RingElem::zero(); r]; r]; k_pp];
-    let mut phi_pp: Vec<Vec<Vec<(usize, RingElem)>>> = vec![vec![vec![]; r]; k_pp];
-    let mut b_double_prime: Vec<RingElem> = Vec::with_capacity(k_pp);
-    for k in 0..k_pp {
-        for (l, c) in const_term_extended.iter().enumerate() {
-            let psi = psis[k][l];
-            if psi == 0 {
-                continue;
-            }
-            for &(i, j, ref aij) in &c.a {
-                let scaled = aij.scale(m, psi);
-                a_pp[k][i][j] = a_pp[k][i][j].add(m, &scaled);
-            }
-            for (wi, phi_i) in &c.phi {
-                let bucket = &mut phi_pp[k][*wi];
-                for (pos, coef) in phi_i {
-                    let scaled = coef.scale(m, psi);
-                    bucket.push((*pos, scaled));
-                }
-            }
-        }
-        for bucket in phi_pp[k].iter_mut() {
-            bucket.sort_by_key(|(p, _)| *p);
-            let mut merged: Vec<(usize, RingElem)> = Vec::with_capacity(bucket.len());
-            for (pos, coef) in bucket.drain(..) {
-                if let Some(last) = merged.last_mut() {
-                    if last.0 == pos {
-                        last.1 = last.1.add(m, &coef);
-                        continue;
-                    }
-                }
-                merged.push((pos, coef));
-            }
-            *bucket = merged;
-        }
-
-        let mut b_full = RingElem::zero();
-        for i in 0..r {
-            for j in i..r {
-                let coef = &a_pp[k][i][j];
-                if coef.is_zero() {
+    // Each k builds an independent (a_pp[k], phi_pp[k], b_double_prime[k]).
+    // Parallelise over k and collect at the end so insertion order matches the
+    // serial baseline.
+    let per_k: Vec<(Vec<Vec<RingElem>>, Vec<Vec<(usize, RingElem)>>, RingElem)> = (0..k_pp)
+        .into_par_iter()
+        .map(|k| {
+            let mut a_pp_k: Vec<Vec<RingElem>> = vec![vec![RingElem::zero(); r]; r];
+            // Dense accumulators indexed by (wi, pos). One Option per slot lets
+            // us tell "uninitialized" from "zero" cheaply; the dense layout
+            // replaces the previous push+sort+merge that dominated wall-clock.
+            let mut phi_dense: Vec<Vec<Option<RingElem>>> = (0..r)
+                .map(|_| (0..n).map(|_| None).collect())
+                .collect();
+            for (l, c) in const_term_extended.iter().enumerate() {
+                let psi = psis[k][l];
+                if psi == 0 {
                     continue;
                 }
-                let ip = ring_inner_product(ring, &witness.w[i], &witness.w[j]);
-                let mut term = ring.mul(coef, &ip);
-                if i != j {
-                    term = term.add(m, &term.clone());
+                for &(i, j, ref aij) in &c.a {
+                    a_pp_k[i][j].add_scaled_assign(m, aij, psi);
                 }
-                b_full = b_full.add(m, &term);
+                for (wi, phi_i) in &c.phi {
+                    let bucket = &mut phi_dense[*wi];
+                    for (pos, coef) in phi_i {
+                        match &mut bucket[*pos] {
+                            Some(existing) => existing.add_scaled_assign(m, coef, psi),
+                            slot @ None => *slot = Some(coef.scale(m, psi)),
+                        }
+                    }
+                }
             }
-        }
-        for (i, phi_i) in phi_pp[k].iter().enumerate() {
-            if phi_i.is_empty() {
-                continue;
+            // Convert dense -> sparse. Already sorted by `pos` because we walk
+            // the dense Vec in order.
+            let phi_pp_k: Vec<Vec<(usize, RingElem)>> = phi_dense
+                .into_iter()
+                .map(|bucket| {
+                    bucket
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(p, opt)| opt.map(|coef| (p, coef)))
+                        .collect()
+                })
+                .collect();
+
+            let mut b_full = RingElem::zero();
+            for i in 0..r {
+                for j in i..r {
+                    let coef = &a_pp_k[i][j];
+                    if coef.is_zero() {
+                        continue;
+                    }
+                    // g[i][j] = ⟨w_i, w_j⟩ was already computed above for the
+                    // garbage commitment; reuse it instead of recomputing the
+                    // D=64 ring multiplications per k_pp.
+                    let mut term = ring.mul(coef, &g[i][j]);
+                    if i != j {
+                        term = term.add(m, &term.clone());
+                    }
+                    b_full = b_full.add(m, &term);
+                }
             }
-            let ip = sparse_phi_inner_product(ring, phi_i, &witness.w[i]);
-            b_full = b_full.add(m, &ip);
-        }
-        b_double_prime.push(b_full);
+            for (i, phi_i) in phi_pp_k.iter().enumerate() {
+                if phi_i.is_empty() {
+                    continue;
+                }
+                let ip = sparse_phi_inner_product(ring, phi_i, &witness.w[i]);
+                b_full = b_full.add(m, &ip);
+            }
+            (a_pp_k, phi_pp_k, b_full)
+        })
+        .collect();
+
+    let mut a_pp: Vec<Vec<Vec<RingElem>>> = Vec::with_capacity(k_pp);
+    let mut phi_pp: Vec<Vec<Vec<(usize, RingElem)>>> = Vec::with_capacity(k_pp);
+    let mut b_double_prime: Vec<RingElem> = Vec::with_capacity(k_pp);
+    for (a_k, phi_k, b_k) in per_k {
+        a_pp.push(a_k);
+        phi_pp.push(phi_k);
+        b_double_prime.push(b_k);
     }
     absorb_ring_vec(transcript, LABEL_BPP, &b_double_prime);
 
@@ -212,11 +240,16 @@ pub fn prove_v2(
     let (_a_agg, phi_agg) = aggregate_full(stmt, &alphas, &betas, &a_pp, &phi_pp);
 
     let h = compute_h(ring, &phi_agg, &witness.w);
+    let h_pairs: Vec<(usize, usize)> = (0..r)
+        .flat_map(|i| (i..r).map(move |j| (i, j)))
+        .collect();
+    let h_chunk_entries: Vec<(usize, usize, Vec<RingElem>)> = h_pairs
+        .par_iter()
+        .map(|&(i, j)| (i, j, decompose(&h[i][j], m, b1, t1)))
+        .collect();
     let mut h_chunks: Vec<Vec<Vec<RingElem>>> = vec![vec![vec![]; r]; r];
-    for i in 0..r {
-        for j in i..r {
-            h_chunks[i][j] = decompose(&h[i][j], m, b1, t1);
-        }
+    for (i, j, chunks) in h_chunk_entries {
+        h_chunks[i][j] = chunks;
     }
     let d_mats = expand_sym_mats(transcript, LABEL_D, r, t1, kappa1, ring);
     let u2 = outer_commit_sym(ring, &d_mats, &h_chunks);
@@ -229,22 +262,34 @@ pub fn prove_v2(
             sample_challenge(transcript, &label, ring)
         })
         .collect();
-    let mut z = vec![RingElem::zero(); n];
-    for i in 0..r {
-        for k in 0..n {
-            let p = ring.mul(&cs[i], &witness.w[i][k]);
-            z[k] = z[k].add(m, &p);
-        }
-    }
+    // z[k] = Σ_i c_i · w_i[k]. Parallelise over the n output positions; each
+    // position reads (c_i, w_i[k]) independently.
+    let z: Vec<RingElem> = (0..n)
+        .into_par_iter()
+        .map(|k| {
+            let mut acc = RingElem::zero();
+            for i in 0..r {
+                let p = ring.mul(&cs[i], &witness.w[i][k]);
+                acc = acc.add(m, &p);
+            }
+            acc
+        })
+        .collect();
     // Decompose each z[k] into 2 chunks base b. The lossless `decompose`
     // puts any overflow into the high chunk so that
     // recompose([z0, z1], b) = z holds — fold's Check 4 depends on this.
-    let mut z0 = vec![RingElem::zero(); n];
-    let mut z1 = vec![RingElem::zero(); n];
-    for k in 0..n {
-        let chunks = decompose(&z[k], m, b, 2);
-        z0[k] = chunks[0].clone();
-        z1[k] = chunks[1].clone();
+    let split: Vec<(RingElem, RingElem)> = (0..n)
+        .into_par_iter()
+        .map(|k| {
+            let chunks = decompose(&z[k], m, b, 2);
+            (chunks[0].clone(), chunks[1].clone())
+        })
+        .collect();
+    let mut z0 = Vec::with_capacity(n);
+    let mut z1 = Vec::with_capacity(n);
+    for (a, bb) in split {
+        z0.push(a);
+        z1.push(bb);
     }
 
     // Upper-triangular g matrix for the wire (lower triangle = zero).
@@ -300,10 +345,15 @@ fn absorb_p_vec(t: &mut Transcript, label: &[u8], v: &[i128]) {
 }
 
 fn sample_ring_element(t: &mut Transcript, label: &[u8], idx: u64, ring: &modring::Ring) -> RingElem {
+    // One SHAKE squeeze per RingElem instead of D=64 separate `derive_below`
+    // calls. Soundness is preserved because the label binds (call-site,
+    // idx) into the transcript before the squeeze, and our protocol never
+    // reuses the same `(label, idx)` pair within one transcript.
+    let sub = [label, &idx.to_le_bytes()].concat();
+    let coeffs = t.derive_field_array(&sub, D, ring.m.q);
     let mut e = RingElem::zero();
-    for k in 0..D {
-        let sub = [label, &idx.to_le_bytes(), &(k as u64).to_le_bytes()].concat();
-        e.c[k] = t.derive_below(&sub, ring.m.q);
+    for (k, v) in coeffs.into_iter().enumerate() {
+        e.c[k] = v;
     }
     e
 }

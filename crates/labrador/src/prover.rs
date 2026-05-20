@@ -23,6 +23,7 @@ use crate::proof::IterationProof;
 use crate::statement::{ring_inner_product, sparse_phi_inner_product, Statement, Witness};
 use crate::transcript::Transcript;
 use modring::{RingElem, D};
+use rayon::prelude::*;
 
 const LABEL_A: &[u8] = b"labrador.A";
 const LABEL_V: &[u8] = b"labrador.v";
@@ -323,49 +324,74 @@ pub fn aggregate_full(
     let r = stmt.r;
     let m = &stmt.ring.m;
     let ring = &stmt.ring;
-    let mut a_agg: Vec<Vec<RingElem>> = vec![vec![RingElem::zero(); r]; r];
-    // phi_agg outer dense over witness index, inner sparse over position.
-    let mut phi_agg: Vec<Vec<(usize, RingElem)>> = vec![vec![]; r];
 
-    // F contributions (full constraints).
-    for (k, c) in stmt.full.iter().enumerate() {
-        let alpha = &alphas[k];
-        if alpha.is_zero() {
-            continue;
-        }
-        for &(i, j, ref aij) in &c.a {
-            let scaled = ring.mul(alpha, aij);
+    // Each F constraint (indexed by k_f) and each F'' aggregator (indexed by
+    // k_pp) contributes independently to (a_agg, phi_agg). Produce two streams
+    // of sparse contributions in parallel, then merge serially. Sparse
+    // representation keeps memory bounded by the contribution size (not r²).
+    type AContrib = Vec<(usize, usize, RingElem)>;
+    type PhiContrib = Vec<(usize, usize, RingElem)>; // (witness_idx, pos, scaled)
+
+    let f_contribs: Vec<(AContrib, PhiContrib)> = stmt
+        .full
+        .par_iter()
+        .enumerate()
+        .filter_map(|(k, c)| {
+            let alpha = &alphas[k];
+            if alpha.is_zero() {
+                return None;
+            }
+            let mut a_local: AContrib = Vec::with_capacity(c.a.len());
+            for &(i, j, ref aij) in &c.a {
+                a_local.push((i, j, ring.mul(alpha, aij)));
+            }
+            let mut phi_local: PhiContrib = Vec::new();
+            for (wi, phi_i) in &c.phi {
+                for (pos, coef) in phi_i {
+                    phi_local.push((*wi, *pos, ring.mul(alpha, coef)));
+                }
+            }
+            Some((a_local, phi_local))
+        })
+        .collect();
+
+    let fpp_contribs: Vec<(AContrib, PhiContrib)> = betas
+        .par_iter()
+        .enumerate()
+        .filter_map(|(k, beta)| {
+            if beta.is_zero() {
+                return None;
+            }
+            let mut a_local: AContrib = Vec::new();
+            for i in 0..r {
+                for j in 0..r {
+                    let aij = &a_pp[k][i][j];
+                    if aij.is_zero() {
+                        continue;
+                    }
+                    a_local.push((i, j, ring.mul(beta, aij)));
+                }
+            }
+            let mut phi_local: PhiContrib = Vec::new();
+            for (wi, phi_i) in phi_pp[k].iter().enumerate() {
+                for (pos, coef) in phi_i {
+                    phi_local.push((wi, *pos, ring.mul(beta, coef)));
+                }
+            }
+            Some((a_local, phi_local))
+        })
+        .collect();
+
+    // Sequential merge: addition into the dense a_agg, push into the
+    // per-witness phi buckets. Both are cheap relative to the parallel work.
+    let mut a_agg: Vec<Vec<RingElem>> = vec![vec![RingElem::zero(); r]; r];
+    let mut phi_agg: Vec<Vec<(usize, RingElem)>> = vec![vec![]; r];
+    for (a_local, phi_local) in f_contribs.into_iter().chain(fpp_contribs.into_iter()) {
+        for (i, j, scaled) in a_local {
             a_agg[i][j] = a_agg[i][j].add(m, &scaled);
         }
-        for (wi, phi_i) in &c.phi {
-            let bucket = &mut phi_agg[*wi];
-            for (pos, coef) in phi_i {
-                let scaled = ring.mul(alpha, coef);
-                bucket.push((*pos, scaled));
-            }
-        }
-    }
-    // F'' contributions.
-    for (k, beta) in betas.iter().enumerate() {
-        if beta.is_zero() {
-            continue;
-        }
-        for i in 0..r {
-            for j in 0..r {
-                let aij = &a_pp[k][i][j];
-                if aij.is_zero() {
-                    continue;
-                }
-                let scaled = ring.mul(beta, aij);
-                a_agg[i][j] = a_agg[i][j].add(m, &scaled);
-            }
-        }
-        for (wi, phi_i) in phi_pp[k].iter().enumerate() {
-            let bucket = &mut phi_agg[wi];
-            for (pos, coef) in phi_i {
-                let scaled = ring.mul(beta, coef);
-                bucket.push((*pos, scaled));
-            }
+        for (wi, pos, scaled) in phi_local {
+            phi_agg[wi].push((pos, scaled));
         }
     }
 

@@ -60,12 +60,40 @@ impl Modulus {
     /// `a * b mod q`, assuming `a, b < q`.
     #[inline]
     pub fn mul(&self, a: u64, b: u64) -> u64 {
-        ((a as u128 * b as u128) % self.q as u128) as u64
+        // Since `a, b < q`, the product fits the precondition of the x86 `div`
+        // instruction (high u64 < q). `reduce` takes the fast path in that case.
+        self.reduce((a as u128) * (b as u128))
     }
 
     /// Reduce an arbitrary `u128` into `[0, q)`.
+    ///
+    /// On x86_64 with `(x >> 64) < q` (the common case for `Modulus::mul`),
+    /// emits a single `DIV r64` instruction (~25 cycles) instead of the
+    /// `__umodti3` libcall (~60–100 cycles). Falls back to `%` otherwise and
+    /// on non-x86 architectures.
     #[inline]
     pub fn reduce(&self, x: u128) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let x_hi = (x >> 64) as u64;
+            if x_hi < self.q {
+                let x_lo = x as u64;
+                let r: u64;
+                // SAFETY: x_hi < q ensures the `div` instruction produces a
+                // 64-bit quotient (no #DE division-overflow exception). All
+                // inputs/outputs are register-only; no memory is touched.
+                unsafe {
+                    core::arch::asm!(
+                        "div {q}",
+                        q = in(reg) self.q,
+                        inout("rax") x_lo => _,
+                        inout("rdx") x_hi => r,
+                        options(pure, nomem, nostack),
+                    );
+                }
+                return r;
+            }
+        }
         (x % self.q as u128) as u64
     }
 
@@ -160,6 +188,32 @@ impl Modulus {
     pub fn sqrt_minus_one(&self) -> Option<u64> {
         self.sqrt(self.q - 1)
     }
+
+    /// A primitive `order`-th root of unity in `F_q`. Panics if `order` does
+    /// not divide `q - 1` (no such root exists).
+    ///
+    /// Algorithm: pick a quadratic non-residue `g` (the standard non-residue
+    /// search used by `sqrt`), then `g^{(q-1)/order}` has order `order`.
+    pub fn primitive_root_of_unity(&self, order: u64) -> u64 {
+        let q = self.q;
+        assert!(order >= 2, "order must be at least 2");
+        assert!(
+            (q - 1) % order == 0,
+            "{order} does not divide q-1 = {} for q = {q}",
+            q - 1
+        );
+        // `g^{(q-1)/2} = q - 1` (i.e. -1) iff g is a quadratic non-residue.
+        let mut g = 2u64;
+        while self.pow(g, (q - 1) / 2) != q - 1 {
+            g += 1;
+            assert!(g < q, "no non-residue found below q");
+        }
+        // ω = g^{(q-1)/order} has multiplicative order exactly `order`.
+        let omega = self.pow(g, (q - 1) / order);
+        debug_assert_eq!(self.pow(omega, order), 1);
+        debug_assert!(order < 2 || self.pow(omega, order / 2) != 1);
+        omega
+    }
 }
 
 /// Deterministic Miller–Rabin primality test, exact for all `u64`.
@@ -223,6 +277,31 @@ pub fn find_prime_5mod8(min_value: u64) -> u64 {
             return c;
         }
         c += 8;
+    }
+}
+
+/// Largest prime `< max_exclusive` congruent to `1 (mod two_d)`.
+///
+/// Used to select an NTT-friendly modulus: `q ≡ 1 (mod 2D)` admits a
+/// primitive `2D`-th root of unity, which is the prerequisite for the
+/// negacyclic NTT over `Z_q[X]/(X^D + 1)`.
+pub fn find_prime_ntt_friendly_below(max_exclusive: u64, two_d: u64) -> u64 {
+    assert!(two_d >= 2 && two_d % 2 == 0, "two_d must be an even integer ≥ 2");
+    assert!(max_exclusive > two_d + 1, "max_exclusive too small");
+    // Largest m < max_exclusive with m ≡ 1 (mod two_d).
+    let mut c: u64 = {
+        let upper = max_exclusive - 1;
+        let r = (upper - 1) % two_d;
+        upper - r
+    };
+    loop {
+        if c < two_d + 1 {
+            panic!("no prime ≡ 1 (mod {two_d}) below {max_exclusive}");
+        }
+        if is_prime(c) {
+            return c;
+        }
+        c -= two_d;
     }
 }
 

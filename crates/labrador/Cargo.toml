@@ -10,6 +10,7 @@ modring = { path = "../modring" }
 sha3 = "0.10"
 serde = { version = "1", features = ["derive"] }
 bincode = { version = "1", default-features = false }
+rayon = { workspace = true }
 
 [dev-dependencies]
 proptest.workspace = true

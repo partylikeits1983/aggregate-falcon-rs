@@ -11,6 +11,40 @@
 
 use crate::transcript::Transcript;
 use modring::{Ring, RingElem, D};
+use rayon::prelude::*;
+use sha3::{
+    digest::{ExtendableOutput, Update, XofReader},
+    Shake256,
+};
+
+/// Fill one `RingElem` worth of coefficients (D residues in `[0, q)`) by
+/// streaming bytes from a single SHAKE256 instance seeded by
+/// `(seed, r, c)`. Rejection sampling drops bytes that would bias the
+/// distribution.
+///
+/// The previous version re-initialised SHAKE256 *per 8-byte coefficient*,
+/// which dominated wall-clock at N=8 (~75M SHAKE inits per aggregate). This
+/// version does one SHAKE init per `RingElem`, then streams enough bytes to
+/// satisfy rejection sampling.
+fn fill_entry(seed: &[u8; 32], r: u64, c: u64, q: u64, elem: &mut RingElem) {
+    let cap = u64::MAX - (u64::MAX % q);
+    let mut h = Shake256::default();
+    h.update(seed);
+    h.update(&r.to_le_bytes());
+    h.update(&c.to_le_bytes());
+    let mut reader = h.finalize_xof();
+    let mut buf = [0u8; 8];
+    for k in 0..D {
+        loop {
+            reader.read(&mut buf);
+            let v = u64::from_le_bytes(buf);
+            if v < cap {
+                elem.c[k] = v % q;
+                break;
+            }
+        }
+    }
+}
 
 /// Expand a deterministic `rows × cols` matrix of `RingElem` from the current
 /// transcript state, under `label`. Each coefficient is a uniform `Z_{q'}`
@@ -23,27 +57,45 @@ pub fn expand_matrix(
     ring: &Ring,
 ) -> Vec<Vec<RingElem>> {
     let q = ring.m.q;
-    let mut out = Vec::with_capacity(rows);
-    for r in 0..rows {
-        let mut row = Vec::with_capacity(cols);
-        for c in 0..cols {
-            let mut elem = RingElem::zero();
-            for k in 0..D {
-                let sub_label = [
-                    label,
-                    b"|",
-                    &(r as u64).to_le_bytes(),
-                    &(c as u64).to_le_bytes(),
-                    &(k as u64).to_le_bytes(),
-                ]
-                .concat();
-                elem.c[k] = t.derive_below(&sub_label, q);
+    // Pull a single 32-byte seed from the transcript, then derive each entry
+    // in parallel from `(seed, r, c)`. The seed commits the entire matrix
+    // back into the transcript via `challenge_bytes` so Fiat-Shamir soundness
+    // is unchanged; the per-entry derivation is transcript-independent so
+    // rows materialise concurrently. One SHAKE init per entry (not per
+    // coefficient) keeps the XOF stream warm across all D coefficients.
+    let seed_vec = t.challenge_bytes(label, 32);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&seed_vec);
+    (0..rows)
+        .into_par_iter()
+        .map(|r| {
+            (0..cols)
+                .map(|c| {
+                    let mut elem = RingElem::zero();
+                    fill_entry(&seed, r as u64, c as u64, q, &mut elem);
+                    elem
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Sequential `A · w` — used as the inner kernel when the caller has already
+/// parallelised an enclosing loop (nested rayon is correct but wasteful for the
+/// small κ × n matrices we hit here).
+#[inline]
+fn matmul_seq(ring: &Ring, a: &[Vec<RingElem>], w: &[RingElem]) -> Vec<RingElem> {
+    let m = &ring.m;
+    a.iter()
+        .map(|row| {
+            let mut acc = RingElem::zero();
+            for (i, x) in w.iter().enumerate() {
+                let p = ring.mul(&row[i], x);
+                acc = acc.add(m, &p);
             }
-            row.push(elem);
-        }
-        out.push(row);
-    }
-    out
+            acc
+        })
+        .collect()
 }
 
 /// `A · w` where `A: rows × cols` and `w: cols`. Result has length `rows`.
@@ -52,7 +104,7 @@ pub fn matmul(ring: &Ring, a: &[Vec<RingElem>], w: &[RingElem]) -> Vec<RingElem>
     let cols = a[0].len();
     assert_eq!(w.len(), cols, "rank mismatch");
     let m = &ring.m;
-    a.iter()
+    a.par_iter()
         .map(|row| {
             let mut acc = RingElem::zero();
             for (i, x) in w.iter().enumerate() {
@@ -70,7 +122,7 @@ pub fn commit_inner(
     a: &[Vec<RingElem>],
     ws: &[Vec<RingElem>],
 ) -> Vec<Vec<RingElem>> {
-    ws.iter().map(|w| matmul(ring, a, w)).collect()
+    ws.par_iter().map(|w| matmul(ring, a, w)).collect()
 }
 
 /// Add two ring vectors elementwise.
@@ -113,20 +165,32 @@ pub fn outer_commit_v(
     } else {
         b_mats[0][0].len()
     };
-    let mut u = vec![RingElem::zero(); kappa1];
     let m = &ring.m;
     for i in 0..r {
         assert_eq!(v_chunks[i].len(), t1, "ragged v_chunks at i={i}");
         assert_eq!(b_mats[i].len(), t1, "ragged b_mats at i={i}");
-        for k in 0..t1 {
-            let contrib = matmul(ring, &b_mats[i][k], &v_chunks[i][k]);
-            assert_eq!(contrib.len(), kappa1);
-            for r1 in 0..kappa1 {
-                u[r1] = u[r1].add(m, &contrib[r1]);
-            }
-        }
     }
-    u
+    // (i, k) pairs are independent; parallelise across them and reduce by
+    // element-wise addition into u.
+    let pairs: Vec<(usize, usize)> = (0..r)
+        .flat_map(|i| (0..t1).map(move |k| (i, k)))
+        .collect();
+    let zero = || vec![RingElem::zero(); kappa1];
+    pairs
+        .par_iter()
+        .fold(zero, |mut acc, &(i, k)| {
+            let contrib = matmul_seq(ring, &b_mats[i][k], &v_chunks[i][k]);
+            for r1 in 0..kappa1 {
+                acc[r1] = acc[r1].add(m, &contrib[r1]);
+            }
+            acc
+        })
+        .reduce(zero, |mut a, b| {
+            for r1 in 0..kappa1 {
+                a[r1] = a[r1].add(m, &b[r1]);
+            }
+            a
+        })
 }
 
 /// Outer commitment over upper-triangular garbage chunks `m_{ij}^{(k)}`.
@@ -158,8 +222,9 @@ pub fn outer_commit_sym(
             .unwrap_or(0);
         first_nonempty
     };
-    let mut u = vec![RingElem::zero(); kappa1];
     let m = &ring.m;
+    // Pre-check ragged shapes and collect the (i, j, k) triples to parallelise.
+    let mut triples: Vec<(usize, usize, usize)> = Vec::new();
     for i in 0..r {
         for j in i..r {
             let n_chunks = chunks[i][j].len();
@@ -170,17 +235,29 @@ pub fn outer_commit_sym(
                 c_mats[i][j].len()
             );
             for k in 0..n_chunks {
-                let cijk = &c_mats[i][j][k];
-                let coef = &chunks[i][j][k];
-                assert_eq!(cijk.len(), kappa1, "c_mats[{i}][{j}][{k}] is not length κ₁");
-                for r1 in 0..kappa1 {
-                    let prod = ring.mul(&cijk[r1], coef);
-                    u[r1] = u[r1].add(m, &prod);
-                }
+                assert_eq!(c_mats[i][j][k].len(), kappa1, "c_mats[{i}][{j}][{k}] is not length κ₁");
+                triples.push((i, j, k));
             }
         }
     }
-    u
+    let zero = || vec![RingElem::zero(); kappa1];
+    triples
+        .par_iter()
+        .fold(zero, |mut acc, &(i, j, k)| {
+            let cijk = &c_mats[i][j][k];
+            let coef = &chunks[i][j][k];
+            for r1 in 0..kappa1 {
+                let prod = ring.mul(&cijk[r1], coef);
+                acc[r1] = acc[r1].add(m, &prod);
+            }
+            acc
+        })
+        .reduce(zero, |mut a, b| {
+            for r1 in 0..kappa1 {
+                a[r1] = a[r1].add(m, &b[r1]);
+            }
+            a
+        })
 }
 
 /// Expand a per-(i,k) B matrix family `B_{i,k} ∈ R^{κ₁ × κ}` from a transcript

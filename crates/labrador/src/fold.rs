@@ -24,6 +24,7 @@ use crate::prover::{aggregate_full, bind_statement, k_double_prime};
 use crate::statement::{DotConstraint, Statement, Witness};
 use crate::transcript::Transcript;
 use modring::{Modulus, Ring, RingElem, D};
+use rayon::prelude::*;
 
 const LABEL_A: &[u8] = b"labrador.A";
 const LABEL_B: &[u8] = b"labrador.B";
@@ -259,29 +260,53 @@ pub fn replay_iteration(
         .map(|k| sample_ring_element(transcript, LABEL_BETA, k as u64, ring))
         .collect();
 
-    let mut a_pp: Vec<Vec<Vec<RingElem>>> = vec![vec![vec![RingElem::zero(); r]; r]; k_pp];
-    let mut phi_pp: Vec<Vec<Vec<(usize, RingElem)>>> = vec![vec![vec![]; r]; k_pp];
-    for k in 0..k_pp {
-        for (l, c) in const_term_extended.iter().enumerate() {
-            let psi = psis[k][l];
-            if psi == 0 {
-                continue;
-            }
-            for &(i, j, ref aij) in &c.a {
-                let scaled = aij.scale(m, psi);
-                a_pp[k][i][j] = a_pp[k][i][j].add(m, &scaled);
-            }
-            for (wi, phi_i) in &c.phi {
-                let bucket = &mut phi_pp[k][*wi];
-                for (pos, coef) in phi_i {
-                    let scaled = coef.scale(m, psi);
-                    bucket.push((*pos, scaled));
+    // k-indexed per-thread reducers; each k is independent. Collect ordered
+    // by k so downstream sequential code sees identical layout.
+    let n = stmt.n;
+    let per_k: Vec<(Vec<Vec<RingElem>>, Vec<Vec<(usize, RingElem)>>)> = (0..k_pp)
+        .into_par_iter()
+        .map(|k| {
+            let mut a_pp_k: Vec<Vec<RingElem>> = vec![vec![RingElem::zero(); r]; r];
+            // Dense accumulator (Option per slot) — see prover_v2 mirror.
+            let mut phi_dense: Vec<Vec<Option<RingElem>>> = (0..r)
+                .map(|_| (0..n).map(|_| None).collect())
+                .collect();
+            for (l, c) in const_term_extended.iter().enumerate() {
+                let psi = psis[k][l];
+                if psi == 0 {
+                    continue;
+                }
+                for &(i, j, ref aij) in &c.a {
+                    a_pp_k[i][j].add_scaled_assign(m, aij, psi);
+                }
+                for (wi, phi_i) in &c.phi {
+                    let bucket = &mut phi_dense[*wi];
+                    for (pos, coef) in phi_i {
+                        match &mut bucket[*pos] {
+                            Some(existing) => existing.add_scaled_assign(m, coef, psi),
+                            slot @ None => *slot = Some(coef.scale(m, psi)),
+                        }
+                    }
                 }
             }
-        }
-        for bucket in phi_pp[k].iter_mut() {
-            merge_phi_bucket(bucket, m);
-        }
+            let phi_pp_k: Vec<Vec<(usize, RingElem)>> = phi_dense
+                .into_iter()
+                .map(|bucket| {
+                    bucket
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(p, opt)| opt.map(|coef| (p, coef)))
+                        .collect()
+                })
+                .collect();
+            (a_pp_k, phi_pp_k)
+        })
+        .collect();
+    let mut a_pp: Vec<Vec<Vec<RingElem>>> = Vec::with_capacity(k_pp);
+    let mut phi_pp: Vec<Vec<Vec<(usize, RingElem)>>> = Vec::with_capacity(k_pp);
+    for (a_k, phi_k) in per_k {
+        a_pp.push(a_k);
+        phi_pp.push(phi_k);
     }
     let (a_agg, phi_agg) = aggregate_full(stmt, &alphas, &betas, &a_pp, &phi_pp);
 
@@ -388,14 +413,17 @@ pub fn fold_statement(
     let b_sq = RingElem::constant(&m, m.mul(b, b));
     let mut full: Vec<DotConstraint> = Vec::new();
 
-    // Check 3: κ linear constraints — A·z = Σ c_i v_i.
-    for k in 0..kappa {
-        full.push(build_check3_row(
-            k, &replay.a_mat, &replay.cs, &fold_layout, &e_layout,
-            &b_re, b1, t1, &ring,
-        ));
-    }
-    let _ = kappa1;
+    // Check 3: κ linear constraints — A·z = Σ c_i v_i (rows independent).
+    let check3: Vec<DotConstraint> = (0..kappa)
+        .into_par_iter()
+        .map(|k| {
+            build_check3_row(
+                k, &replay.a_mat, &replay.cs, &fold_layout, &e_layout,
+                &b_re, b1, t1, &ring,
+            )
+        })
+        .collect();
+    full.extend(check3);
     // Check 4: ⟨z, z⟩ = Σ c_i c_j g_ij (quadratic + linear).
     full.push(build_check4(
         &replay.cs, &fold_layout, &e_layout, &b_re, &b_sq, b2, t2, r, &ring,
@@ -408,18 +436,26 @@ pub fn fold_statement(
     full.push(build_check6(
         &replay.a_agg, &fold_layout, &e_layout, b1, b2, t1, t2, r, &replay.b_agg, &ring,
     ));
-    // Check 8: u_1 openings (κ₁ linear, one per row).
-    for r1 in 0..kappa1 {
-        full.push(build_check8_row(
-            r1, &proof.u1, &replay.b_mats, &replay.c_mats, &fold_layout, &e_layout, r, t1, t2, kappa, &ring,
-        ));
-    }
-    // Check 9: u_2 openings (κ₁ linear, one per row).
-    for r1 in 0..kappa1 {
-        full.push(build_check9_row(
-            r1, &proof.u2, &replay.d_mats, &fold_layout, &e_layout, r, t1, &ring,
-        ));
-    }
+    // Check 8: u_1 openings (κ₁ rows independent).
+    let check8: Vec<DotConstraint> = (0..kappa1)
+        .into_par_iter()
+        .map(|r1| {
+            build_check8_row(
+                r1, &proof.u1, &replay.b_mats, &replay.c_mats, &fold_layout, &e_layout, r, t1, t2, kappa, &ring,
+            )
+        })
+        .collect();
+    full.extend(check8);
+    // Check 9: u_2 openings (κ₁ rows independent).
+    let check9: Vec<DotConstraint> = (0..kappa1)
+        .into_par_iter()
+        .map(|r1| {
+            build_check9_row(
+                r1, &proof.u2, &replay.d_mats, &fold_layout, &e_layout, r, t1, &ring,
+            )
+        })
+        .collect();
+    full.extend(check9);
 
     // For the recursion demonstration, pass the parent statement's β² through
     // as a loose bound — the lossless-overflow decomposition currently
@@ -506,36 +542,67 @@ fn build_folded_witness(
 ) -> Witness {
     let n_prime = fold_layout.n_prime;
     let r_prime = fold_layout.r_prime;
+    // The fold layout maps each source position to a unique (witness_idx, off)
+    // slot, so writes are non-overlapping. Collect (wi, off, value) triples
+    // from the four independent index spaces (z0, z1, V, G/H) and apply them
+    // serially. The triples can be produced in parallel since the index spaces
+    // and the per-triple work (which clones a single ring element) are
+    // independent; the apply pass is O(slots) and trivially fast.
     let mut w: Vec<Vec<RingElem>> = (0..r_prime).map(|_| vec![RingElem::zero(); n_prime]).collect();
-    for p in 0..n {
-        let (wi, off) = fold_layout.z0(p);
-        w[wi][off] = z0[p].clone();
-        let (wi, off) = fold_layout.z1(p);
-        w[wi][off] = z1[p].clone();
+
+    let z_triples: Vec<(usize, usize, RingElem)> = (0..n)
+        .into_par_iter()
+        .flat_map_iter(|p| {
+            let (wi0, off0) = fold_layout.z0(p);
+            let (wi1, off1) = fold_layout.z1(p);
+            [
+                (wi0, off0, z0[p].clone()),
+                (wi1, off1, z1[p].clone()),
+            ]
+        })
+        .collect();
+    for (wi, off, v) in z_triples {
+        w[wi][off] = v;
     }
-    for i in 0..r {
-        for k in 0..t1 {
-            for idx in 0..kappa {
-                let pos = e_layout.pos(EIdx::V(i, k, idx));
-                let (wi, off) = fold_layout.e(pos);
-                w[wi][off] = v_chunks[i][k][idx].clone();
-            }
-        }
+
+    let v_triples: Vec<(usize, usize, RingElem)> = (0..r)
+        .into_par_iter()
+        .flat_map_iter(|i| {
+            (0..t1).flat_map(move |k| {
+                (0..kappa).map(move |idx| {
+                    let pos = e_layout.pos(EIdx::V(i, k, idx));
+                    let (wi, off) = fold_layout.e(pos);
+                    (wi, off, v_chunks[i][k][idx].clone())
+                })
+            })
+        })
+        .collect();
+    for (wi, off, v) in v_triples {
+        w[wi][off] = v;
     }
-    for i in 0..r {
-        for j in i..r {
-            for k in 0..t2 {
-                let pos = e_layout.pos(EIdx::G(i, j, k));
-                let (wi, off) = fold_layout.e(pos);
-                w[wi][off] = g_chunks[i][j][k].clone();
-            }
-            for k in 0..t1 {
-                let pos = e_layout.pos(EIdx::H(i, j, k));
-                let (wi, off) = fold_layout.e(pos);
-                w[wi][off] = h_chunks[i][j][k].clone();
-            }
-        }
+
+    let gh_triples: Vec<(usize, usize, RingElem)> = (0..r)
+        .into_par_iter()
+        .flat_map_iter(|i| {
+            (i..r).flat_map(move |j| {
+                let gs = (0..t2).map(move |k| {
+                    let pos = e_layout.pos(EIdx::G(i, j, k));
+                    let (wi, off) = fold_layout.e(pos);
+                    (wi, off, g_chunks[i][j][k].clone())
+                });
+                let hs = (0..t1).map(move |k| {
+                    let pos = e_layout.pos(EIdx::H(i, j, k));
+                    let (wi, off) = fold_layout.e(pos);
+                    (wi, off, h_chunks[i][j][k].clone())
+                });
+                gs.chain(hs)
+            })
+        })
+        .collect();
+    for (wi, off, v) in gh_triples {
+        w[wi][off] = v;
     }
+
     Witness { w }
 }
 
@@ -906,10 +973,13 @@ fn absorb_p_vec(t: &mut Transcript, label: &[u8], v: &[i128]) {
 }
 
 fn sample_ring_element(t: &mut Transcript, label: &[u8], idx: u64, ring: &Ring) -> RingElem {
+    // Single SHAKE squeeze for all D=64 coefficients. See the prover_v2 mirror
+    // for the soundness argument; the prover and verifier walk the same path.
+    let sub = [label, &idx.to_le_bytes()].concat();
+    let coeffs = t.derive_field_array(&sub, D, ring.m.q);
     let mut e = RingElem::zero();
-    for k in 0..D {
-        let sub = [label, &idx.to_le_bytes(), &(k as u64).to_le_bytes()].concat();
-        e.c[k] = t.derive_below(&sub, ring.m.q);
+    for (k, v) in coeffs.into_iter().enumerate() {
+        e.c[k] = v;
     }
     e
 }

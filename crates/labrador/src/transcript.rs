@@ -119,6 +119,50 @@ impl Transcript {
     pub fn derive_field(&mut self, label: &[u8], q: u64) -> u64 {
         self.derive_below(label, q)
     }
+
+    /// Derive `n` uniform field elements `< q` from a *single* SHAKE squeeze.
+    ///
+    /// Equivalent in distribution to calling `derive_field(label_i, q)` `n`
+    /// times with disjoint labels, but ~`n`× fewer SHAKE permutations. Used by
+    /// `sample_ring_element` (D=64 coefficients) and similar bulk samplers
+    /// that previously dominated wall-clock through per-coefficient absorbs.
+    pub fn derive_field_array(&mut self, label: &[u8], n: usize, q: u64) -> Vec<u64> {
+        assert!(q > 1, "q must be > 1");
+        // Bind the label + (n, q) into the transcript so the squeeze is unique.
+        self.hasher.update(b"cm:");
+        self.hasher.update(&(label.len() as u64).to_le_bytes());
+        self.hasher.update(label);
+        self.hasher.update(&(n as u64).to_le_bytes());
+        self.hasher.update(&q.to_le_bytes());
+
+        let snapshot = self.hasher.clone();
+        let mut reader = snapshot.finalize_xof();
+        let cap = u64::MAX - (u64::MAX % q);
+        let mut out = Vec::with_capacity(n);
+        let mut buf = [0u8; 8];
+        // Stream 8-byte chunks; rejection sampling drops any v ≥ cap.
+        // For practical q (random prime near 2^k), rejection rate is small.
+        let mut guard: u32 = 0;
+        while out.len() < n {
+            reader.read(&mut buf);
+            let v = u64::from_le_bytes(buf);
+            if v < cap {
+                out.push(v % q);
+            }
+            guard = guard.wrapping_add(1);
+            if guard > 1_000_000 + (n as u32 * 4) {
+                panic!("derive_field_array rejection-sampling exceeded guard");
+            }
+        }
+
+        // Bind the squeezed `n` count back so subsequent challenges chain.
+        // We don't need to absorb the values themselves — the label already
+        // disambiguates this call site from any other, and (n, q) above already
+        // committed to the shape. Absorb a sentinel marking the call's end.
+        self.hasher.update(b"chal-array-out:");
+        self.hasher.update(&(n as u64).to_le_bytes());
+        out
+    }
 }
 
 #[cfg(test)]
