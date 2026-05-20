@@ -6,6 +6,11 @@
 //! is tested.
 
 use crate::modulus::Modulus;
+use serde::{
+    de::{SeqAccess, Visitor},
+    ser::SerializeTuple,
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 
 /// Degree of the LaBRADOR ring (`X^64 + 1`).
 pub const D: usize = 64;
@@ -15,6 +20,38 @@ pub const D: usize = 64;
 pub struct RingElem {
     /// Coefficients `c[i]` of `X^i`, each a canonical residue in `[0, q)`.
     pub c: [u64; D],
+}
+
+impl Serialize for RingElem {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut tup = s.serialize_tuple(D)?;
+        for v in &self.c {
+            tup.serialize_element(v)?;
+        }
+        tup.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for RingElem {
+    fn deserialize<De: Deserializer<'de>>(d: De) -> Result<Self, De::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = RingElem;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "RingElem with {D} u64 coefficients")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<RingElem, A::Error> {
+                let mut c = [0u64; D];
+                for slot in &mut c {
+                    *slot = seq.next_element()?.ok_or_else(|| {
+                        serde::de::Error::invalid_length(D, &"RingElem requires D elements")
+                    })?;
+                }
+                Ok(RingElem { c })
+            }
+        }
+        d.deserialize_tuple(D, V)
+    }
 }
 
 impl RingElem {

@@ -4,6 +4,7 @@ members = [
     "crates/modring",
     "crates/falcon-relation",
     "crates/labrador",
+    "crates/aggregate-falcon",
 ]
 
 [workspace.package]

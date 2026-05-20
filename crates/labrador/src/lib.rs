@@ -11,7 +11,10 @@ pub mod commit;
 pub mod garbage;
 pub mod jl;
 pub mod params;
+pub mod proof;
+pub mod prover;
 pub mod statement;
 pub mod transcript;
+pub mod verifier;
 
 pub use statement::{ConstTermConstraint, DotConstraint, Statement, Witness};

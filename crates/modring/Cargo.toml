@@ -6,6 +6,7 @@ license.workspace = true
 description = "LaBRADOR base field Fq and ring Z_Q[X]/(X^64+1) with 2-splitting CRT"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 proptest.workspace = true

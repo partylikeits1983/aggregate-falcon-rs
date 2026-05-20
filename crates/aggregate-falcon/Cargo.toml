@@ -1,0 +1,17 @@
+[package]
+name = "aggregate-falcon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LaBRADOR-based aggregation of Falcon-512 signatures"
+
+[dependencies]
+labrador = { path = "../labrador" }
+falcon-relation = { path = "../falcon-relation" }
+modring = { path = "../modring" }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+[dev-dependencies]
+pqcrypto-falcon = "0.4"
+pqcrypto-traits = "0.3"
