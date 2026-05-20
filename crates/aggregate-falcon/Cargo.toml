@@ -18,6 +18,7 @@ pqcrypto-traits = "0.3"
 falcon-rust = "0.1.2"
 criterion = { version = "0.5", features = ["html_reports"] }
 indicatif = "0.17"
+rayon = "1"
 
 [[bench]]
 name = "aggregate"

@@ -34,7 +34,7 @@ use modring::{Ring, RingElem};
 /// `k` of `φᵢ` where the coefficient `φᵢ[k] ∈ S_{q'}` is non-zero. This is
 /// the §F.2 form-constraint regime — there are O(N·d/ρ) constraints with
 /// O(1) non-zeros each, so a dense `φᵢ` of length `8N` would dominate memory.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DotConstraint {
     /// `(i, j, a_{i,j})` with `i ≤ j`.
     pub a: Vec<(usize, usize, RingElem)>,
@@ -48,7 +48,7 @@ pub struct DotConstraint {
 
 /// A constant-term constraint: same shape as [`DotConstraint`] but only the
 /// constant term of `f` must be zero (modulo `q'`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConstTermConstraint {
     pub a: Vec<(usize, usize, RingElem)>,
     pub phi: Vec<(usize, Vec<(usize, RingElem)>)>,

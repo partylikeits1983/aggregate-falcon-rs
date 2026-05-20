@@ -203,12 +203,35 @@ pub fn verify(pairs: &[PublicPair], proof: &AggregateProof) -> Result<(), Verify
     }
     let ring = Ring::new(Modulus::new(q_prime));
 
-    // Reconstruct "public" FalconSig views (h from pk; c from nonce + msg).
-    // s1, s2 are set to zero — they're never read by the constraint builders
-    // (only Falcon-eq uses h and c; four-square + form constraints use
-    // neither).
+    let stmt = build_verifier_statement(pairs, &proof.nonces, proof.beta_sq, &ring)?;
+    verify_aggregate(&stmt, &proof.labrador, &params, TRANSCRIPT_DOMAIN).map_err(VerifyError::Labrador)
+}
+
+/// Build the verifier-side LaBRADOR `Statement` from public-only inputs
+/// `(pk, msg, nonce)`. The witness components `s1, s2` of every reconstructed
+/// `FalconSig` are zeroed because the constraint builders only read `h` and
+/// `c` from each sig (Falcon-eq uses `h, c`; four-square and form
+/// constraints use neither). The
+/// `crates/aggregate-falcon/tests/roundtrip.rs::prover_and_verifier_statements_match`
+/// test pins this invariant — if a future constraint builder starts reading
+/// `s1` or `s2`, that test will fail loudly rather than silently producing a
+/// different statement on the verifier side.
+pub fn build_verifier_statement(
+    pairs: &[PublicPair],
+    nonces: &[Vec<u8>],
+    beta_sq: i128,
+    ring: &Ring,
+) -> Result<labrador::statement::Statement, VerifyError> {
+    use falcon_relation::relation::{
+        add_falcon_eq_constraints, add_form_constraints_e, add_form_constraints_ep,
+        add_form_constraints_y_padding, add_form_constraints_yp, add_four_square_constraints,
+        WitnessLayout,
+    };
+    use labrador::statement::Statement;
+
+    assert_eq!(pairs.len(), nonces.len(), "pairs/nonces length mismatch");
     let mut sigs_view: Vec<FalconSig> = Vec::with_capacity(pairs.len());
-    for ((pk_bytes, message), nonce_vec) in pairs.iter().zip(proof.nonces.iter()) {
+    for ((pk_bytes, message), nonce_vec) in pairs.iter().zip(nonces.iter()) {
         if nonce_vec.len() != NONCE_LEN {
             return Err(VerifyError::DecodeFailed(format!(
                 "nonce length {} != {NONCE_LEN}",
@@ -228,41 +251,25 @@ pub fn verify(pairs: &[PublicPair], proof: &AggregateProof) -> Result<(), Verify
         });
     }
 
-    // The statement-builder also uses `build_honest_witness` to compute a
-    // throwaway witness — we don't use the returned witness on the verifier
-    // side. But `build_honest_witness` calls `compute_v_signed` which uses
-    // s1, s2, h, c — with our zero s1, s2, the integer check
-    // `(c - 0 - h·0) % q == 0` would fail. So we need a statement builder
-    // that DOESN'T require a witness. Let's call only the constraint
-    // builders directly.
-
-    use falcon_relation::relation::{
-        add_falcon_eq_constraints, add_form_constraints_e, add_form_constraints_ep,
-        add_form_constraints_y_padding, add_form_constraints_yp, add_four_square_constraints,
-        WitnessLayout,
-    };
-    use labrador::statement::Statement;
-
     let layout = WitnessLayout::new(sigs_view.len());
     let mut stmt = Statement {
-        ring,
+        ring: *ring,
         n: layout.n_s(),
         r: layout.r(),
         full: vec![],
         const_term: vec![],
-        beta_sq: proof.beta_sq,
+        beta_sq,
     };
-    add_falcon_eq_constraints(&mut stmt, &layout, &sigs_view, &ring);
+    add_falcon_eq_constraints(&mut stmt, &layout, &sigs_view, ring);
     add_four_square_constraints(
         &mut stmt,
         &layout,
         falcon_relation::falcon_ring::FALCON_BETA_SQ,
-        &ring,
+        ring,
     );
-    add_form_constraints_y_padding(&mut stmt, &layout, &ring);
-    add_form_constraints_yp(&mut stmt, &layout, &ring);
-    add_form_constraints_e(&mut stmt, &layout, &ring);
-    add_form_constraints_ep(&mut stmt, &layout, &ring);
-
-    verify_aggregate(&stmt, &proof.labrador, &params, TRANSCRIPT_DOMAIN).map_err(VerifyError::Labrador)
+    add_form_constraints_y_padding(&mut stmt, &layout, ring);
+    add_form_constraints_yp(&mut stmt, &layout, ring);
+    add_form_constraints_e(&mut stmt, &layout, ring);
+    add_form_constraints_ep(&mut stmt, &layout, ring);
+    Ok(stmt)
 }

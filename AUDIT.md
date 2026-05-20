@@ -1,6 +1,7 @@
 # Audit: `aggregate-falcon-rs`
 
 **Audited at**: commit `c7c5374`, 2026-05-20
+**Status update**: 2026-05-20 audit-and-perf pass — CONCERN-1 already closed by `e7fbe17` (the prover now uses `Params::beta_init_sq()`, not the `1<<60` hardcode). CONCERN-3 closed by `prover_and_verifier_statements_match` test in `tests/roundtrip.rs`. CONCERN-2 partially addressed: Rayon is now used widely (see §6); the prover/fold replay duplication is eliminated via `prove_v2_with_replay` + `fold_with_replay`. Norm-bound recursion measurement is in §7.
 **Paper**: `labrador.pdf` (sha256 prefix `2b18db11cc45fe0b`), *Aggregating Falcon Signatures with LaBRADOR*, Aardal–Aranha–Boudgoust–Kolby–Takahashi, CRYPTO 2024
 
 ## TL;DR
@@ -55,29 +56,27 @@ The `UNVERIFIED` rows are the ones a future audit pass should walk against the p
 
 ## 3. Concerns
 
-### CONCERN-1: `select_beta_sq` does not use `Params::beta_init_sq`
+### CONCERN-1: `select_beta_sq` does not use `Params::beta_init_sq` — **CLOSED (`e7fbe17`)**
 
-`crates/aggregate-falcon/src/lib.rs:101-103` hard-codes the initial norm bound to `1 << 60`:
+The prover now uses `params.beta_init_sq()` at `crates/aggregate-falcon/src/lib.rs:166`. The `select_beta_sq()` hardcode is gone. No code change as part of this audit pass.
 
-```rust
-fn select_beta_sq() -> i128 {
-    1i128 << 60
-}
-```
+Earlier text (kept for historical context): the bound used to be hard-coded to `1<<60`, weakening the soundness margin. The two LaBRADOR modules already expose the paper-correct value at `crates/labrador/src/params.rs:149-152`.
 
-The in-source comment at `:96-100` admits this is a stop-gap and that `Params::beta_init_sq()` should be wired in once JL projection constraints land — and they have landed (Phase 6 Session E in commit `34d5560`). Until this is replaced, the verifier checks against a loose bound which weakens the soundness margin the paper relies on. The two LaBRADOR modules already expose the paper-correct value at `crates/labrador/src/params.rs:149-152`.
+### CONCERN-2: Single-threaded prover with quadratic-shaped hot loops — **Largely addressed**
 
-**Severity**: medium — the prover/verifier transcript and constraint structure are correct; only the global ℓ² bound is loose. Follow-up: swap `select_beta_sq()` for `Params::for_n(N).beta_init_sq()` and re-run `tests/roundtrip.rs` plus the new `tests/large_n_e2e.rs`.
+The "no rayon" claim is no longer accurate. Rayon now lives in `commit.rs` (`par_iter` in `expand_matrix`, `matmul`, `commit_inner`, both `outer_commit_*`), `jl.rs` (`sample_projection`, `project_vector`, `project_combined`), `garbage.rs` (`compute_g`, `compute_h`), `prover_v2.rs` (decompose loops, `compute_g`, `k_pp` per-constraint aggregation, z amortize), `verifier_v2.rs` (`k_pp` aggregation), and `fold.rs` (replay's `k_pp`, build_check rows). The constraint-aggregation hot loop is parallel across `k_pp` tasks.
 
-### CONCERN-2: Single-threaded prover with quadratic-shaped hot loops
+Two further wins landed in the 2026-05-20 pass:
+- `prove_v2_with_replay` + `fold_with_replay` (`prover_v2.rs`, `fold.rs`): the multi-iteration prover used to run `prove_v2` and then `fold` on the same iteration, with each independently walking the transcript and re-running the `k_pp` aggregation. At N=8 this duplication was costing ~550ms per intermediate iter (about half the iter total). The new replay-share path makes `fold` consume the prover's already-derived matrices and `aggregate_full` output; `fold_total` drops from ~552ms to ~10ms at iter 0 on N=8.
+- Clone reduction in `fold::build_folded_witness`: removed the parallel `Vec<(usize, usize, RingElem)>` collect-then-apply pattern at `fold.rs:553-606` that doubled peak memory before serial application. Now a single serial pass writes directly into `w`, eliminating the transient that was a likely contributor to the OOM kills the user reported at N=256 on the x86 box.
 
-`prover_v2.rs:145-161` aggregates F′ constraints with a triply-nested loop `for k in 0..k_pp { for c in const_term_extended { for (i, j) in c.a { … } } }`. The structure is protocol-correct per §F.1, but at N=1024 it iterates roughly `k_pp · (256 + O(N·D/ρ))` sparse entries serially. No `rayon` or `par_iter` anywhere in the workspace (`grep` confirms zero hits). Combined with cloning RingElems in the fold loops (`fold.rs:512,514,521,530,535`), this gives the observed ~50s at N=8 and the extrapolated ~230h at N=1024.
+**Severity**: still high asymptotically (the protocol is O(N²) per §F.1), but the recent commits + this pass have brought N=128 from "doesn't finish" to ~1 min (`6932ea4`) and N=256 to ~127s aggregate / ~57s verify on the user's reference machine.
 
-**Severity**: high for usability, zero for soundness — the asymptotic cost is paper-inherent. The optimization roadmap is `PERF_PLAN.md`.
+### CONCERN-3: Verifier statement reconstruction with `s1, s2 = 0` — **CLOSED**
 
-### CONCERN-3: Verifier statement reconstruction with `s1, s2 = 0`
+Closed by `prover_and_verifier_statements_match` in `crates/aggregate-falcon/tests/roundtrip.rs`: builds the prover-side statement from real Falcon sigs and the verifier-side statement from public-only `(pk, msg, nonce)` views with `s1=s2=0`, then asserts every public field of `Statement` (and every constraint in `full` / `const_term`) is structurally equal. Test passes today. The extracted helper `aggregate_falcon::build_verifier_statement` is what the test calls — it is the same code the production `verify()` path runs, factored out so the test can reach it.
 
-`crates/aggregate-falcon/src/lib.rs:160-178` reconstructs `FalconSig` views for the verifier with secret components zeroed, then runs the same constraint builders (`add_falcon_eq_constraints`, etc.) the prover used. The constraint builders are documented as only reading the public components `(h, c)` from `FalconSig`. UNVERIFIED that no constraint builder secretly reads `s1` or `s2`; if any does, verification would silently use zero in place of the real values. Suggested follow-up: a one-shot test that calls `build_falcon_statement(pubonly_sigs, …)` and `build_falcon_statement(full_sigs, …)` and asserts the resulting `Statement` (modulo the witness) is byte-equal.
+The constraint builders read only `(h, c)` from each `FalconSig`; the test makes that invariant load-bearing — any future change that starts reading `s1` or `s2` from a constraint builder will fail the test loudly.
 
 ## 4. Tests
 
@@ -99,6 +98,34 @@ Removed in this pass (purely analytical, no real proof generation):
 ## 5. Out of scope for this audit
 
 - Hand-walking each `UNVERIFIED` math row against the paper text (needs a reader with the paper open).
-- Performance work (see `PERF_PLAN.md`).
-- Soundness analysis of `select_beta_sq()`'s loose `1 << 60` bound (CONCERN-1).
-- A negative-case test confirming the verifier reads only public `FalconSig` fields (CONCERN-3).
+- Performance work beyond the two wins listed under CONCERN-2 (see `PERF_PLAN.md`).
+- Tight norm-bound enforcement — see §7. Honest proofs currently exceed `beta_prime_sq` at later iterations; deferred until rejection sampling lands.
+
+## 6. New tests added in the 2026-05-20 audit pass
+
+In `crates/aggregate-falcon/tests/roundtrip.rs`:
+- `prover_and_verifier_statements_match` — closes CONCERN-3.
+- `malformed_nonce_length_rejects` — wrong nonce length must surface a `DecodeFailed("nonce length …")` error, not a downstream constraint mismatch.
+- `swapped_public_pairs_rejects` — swapping `(pk, msg)` between two slots must reject (each slot binds (pk_i, msg_i, nonce_i)).
+- `flipped_intermediate_u1_rejects` and `flipped_intermediate_p_rejects` — tamper the first intermediate iteration's u1/p, not just the final z0. Extends `flipped_proof_byte_rejects` to intermediate-iteration data.
+
+In `crates/falcon-relation/src/relation.rs` (unit):
+- `compute_v_signed_panics_on_non_divisible_input` — the `debug_assert_eq!` divisibility check has been promoted to a release-active `assert!`, so any future caller that fabricates `(s1, s2, h, c)` outside the Falcon verification invariant panics rather than silently truncating to a wrong `v`.
+
+In `crates/labrador/tests/norm_bound_audit.rs` (new):
+- `honest_proof_norm_bounds_loose_and_tight` — see §7.
+
+## 7. Norm-bound recursion audit
+
+`fold_statement` currently propagates `stmt.beta_sq` from one iteration to the next unchanged (`fold.rs:472`); the paper's tight estimator value `beta_prime_sq(it_params)` exists at `fold.rs:485` but is not enforced. The new test `tests/norm_bound_audit.rs` measures the honest prover's decomposed-norm² at every iteration and compares to both bounds.
+
+At N=8, depth=4, with `beta_init_sq = 1186126502473` carried as the loose bound:
+
+| iter | stmt.beta_sq (loose) | measured        | / loose | beta_prime² (tight) | / tight |
+|------|----------------------|-----------------|---------|---------------------|---------|
+| 0    | 1,186,126,502,473    | 20,346,134,099  | 0.017   | 26,432,495,951      | 0.770   |
+| 1    | 1,186,126,502,473    | 561,294,776     | 0.000   | 565,936,178         | 0.992   |
+| 2    | 1,186,126,502,473    | 32,880,718      | 0.000   | 29,170,777          | **1.127** |
+| 3    | 1,186,126,502,473    | 6,767,941,886   | 0.006   | 5,266,740,191       | **1.285** |
+
+**Finding.** Honest proofs exceed the paper's tight bound at iter 2 (by 12.7%) and iter 3 (by 28.5%). The loose `stmt.beta_sq` has massive headroom and is satisfied at every iter. **Tightening `fold_statement` to use `beta_prime_sq` today would reject honest proofs**, so the carry-through stays as-is. The in-source comment at `fold.rs:460-473` captures this; the test pins the loose bound as a regression guard and prints the tight ratios so the next pass (post Session E rejection sampling) can re-evaluate.

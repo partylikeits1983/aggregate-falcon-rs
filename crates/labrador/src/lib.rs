@@ -16,6 +16,7 @@ pub mod params;
 pub mod proof;
 pub mod prover;
 pub mod prover_v2;
+pub mod stage_timing;
 pub mod statement;
 pub mod transcript;
 pub mod verifier;

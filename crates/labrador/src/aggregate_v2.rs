@@ -18,13 +18,15 @@
 //! intermediate iteration. Accepting the deepest `verify_v2` implies all
 //! intermediate checks pass.
 
-use crate::fold::{fold, fold_statement, FoldOutput};
+use crate::fold::{fold_statement, fold_with_replay, FoldOutput};
 use crate::params::Params;
 use crate::proof::{AggregateProofV2, IterationProofV2, VerifyError};
-use crate::prover_v2::prove_v2;
+use crate::prover_v2::{prove_v2, prove_v2_with_replay};
+use crate::stage_timing;
 use crate::statement::{Statement, Witness};
 use crate::transcript::Transcript;
 use crate::verifier_v2::verify_v2;
+use std::time::Instant;
 
 /// Minimal progress callback for the multi-iteration prover. Each LaBRADOR
 /// iteration emits one `iter_start` before its work begins and one `iter_done`
@@ -73,16 +75,22 @@ pub fn prove_aggregate_with_progress<P: ProgressSink>(
 
     for k in 0..(depth - 1) {
         sink.iter_start(k, depth, "prove_v2 + fold");
-        // Snapshot the transcript BEFORE prove_v2; fold needs the same state.
-        let mut t_fold = t_prove.clone();
-        let proof_k = prove_v2(&cur_stmt, &cur_witness, &params.iterations[k], &mut t_prove);
+        let ts = Instant::now();
+        let (proof_k, replay) =
+            prove_v2_with_replay(&cur_stmt, &cur_witness, &params.iterations[k], &mut t_prove);
+        stage_timing::record("prove_v2_total", ts.elapsed());
 
         // Fold using params.iterations[k+1].(prev_nu, prev_mu) — those are the
-        // folding parameters that produced iter[k+1]'s rank.
+        // folding parameters that produced iter[k+1]'s rank. The replay we
+        // received from prove_v2_with_replay lets us skip fold's own
+        // (otherwise redundant) transcript walk.
         let nu = params.iterations[k + 1].prev_nu as usize;
         let mu = params.iterations[k + 1].prev_mu as usize;
+        let ts = Instant::now();
         let FoldOutput { statement, witness } =
-            fold(&cur_stmt, &proof_k, &params.iterations[k], nu, mu, &mut t_fold);
+            fold_with_replay(&cur_stmt, &proof_k, &params.iterations[k], nu, mu, &replay);
+        stage_timing::record("fold_total", ts.elapsed());
+        stage_timing::mark("iter-end");
 
         intermediate.push(proof_k.into_intermediate());
         cur_stmt = statement;
@@ -91,12 +99,15 @@ pub fn prove_aggregate_with_progress<P: ProgressSink>(
     }
 
     sink.iter_start(depth - 1, depth, "prove_v2 (final)");
+    let ts = Instant::now();
     let final_iter = prove_v2(
         &cur_stmt,
         &cur_witness,
         &params.iterations[depth - 1],
         &mut t_prove,
     );
+    stage_timing::record("prove_v2_total", ts.elapsed());
+    stage_timing::mark("iter-end");
     sink.iter_done(depth - 1);
 
     AggregateProofV2 {
@@ -130,9 +141,16 @@ pub fn verify_aggregate(
     for (k, inter_proof) in proof.intermediate.iter().enumerate() {
         let nu = params.iterations[k + 1].prev_nu as usize;
         let mu = params.iterations[k + 1].prev_mu as usize;
+        let ts = Instant::now();
         let next_stmt = fold_statement(&cur_stmt, inter_proof, &params.iterations[k], nu, mu, &mut t);
+        stage_timing::record("verify_fold_statement", ts.elapsed());
+        stage_timing::mark("verify-iter-end");
         cur_stmt = next_stmt;
     }
 
-    verify_v2(&cur_stmt, &proof.final_iter, &params.iterations[depth - 1], &mut t)
+    let ts = Instant::now();
+    let res = verify_v2(&cur_stmt, &proof.final_iter, &params.iterations[depth - 1], &mut t);
+    stage_timing::record("verify_v2_final", ts.elapsed());
+    stage_timing::mark("verify-iter-end");
+    res
 }

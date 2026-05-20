@@ -15,6 +15,7 @@ dependencies = [
  "modring",
  "pqcrypto-falcon",
  "pqcrypto-traits",
+ "rayon",
  "serde",
 ]
 

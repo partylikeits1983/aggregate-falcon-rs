@@ -5,7 +5,13 @@
 //! aggregating, then reports whether the aggregate proof actually beats naive
 //! concatenation of the raw signatures.
 //!
-//!     cargo run --release --example roundtrip [N]
+//!     cargo run --release --example roundtrip -- [N] [--threads N]
+//!
+//! Environment knobs:
+//!   - `RAYON_NUM_THREADS=K` — Rayon's standard pool size selector. Honored
+//!     unless `--threads K` is passed (which takes precedence).
+//!   - `STAGE_TIMING=1` — print a per-stage breakdown of prove_v2 and the
+//!     verifier loop. Stages mirror the paper's protocol steps. Off by default.
 
 use aggregate_falcon::{
     aggregate_depth, aggregate_with_progress, verify, FalconInstance, Progress, PublicPair,
@@ -83,9 +89,93 @@ impl Progress for CliProgress {
     }
 }
 
+/// Print a stage-timing table grouped by iteration. Records use the literal
+/// sentinel name `"iter-end"` (prover) or `"verify-iter-end"` (verifier) to
+/// mark group boundaries; the sentinel itself is dropped from the table.
+fn print_stage_table(title: &str, records: Vec<(&'static str, Duration)>) {
+    if records.is_empty() {
+        return;
+    }
+    println!("\n  {title}:");
+    let mut iter_num = 0usize;
+    let mut iter_total = Duration::ZERO;
+    let mut header_printed = false;
+    let emit_header = |iter_num: usize| {
+        println!("    --- iter {iter_num} ---");
+    };
+    for (name, dur) in records {
+        if name == "iter-end" || name == "verify-iter-end" {
+            println!("    {:<32}  {:>10.2?}  (iter total)", "  └─ total", iter_total);
+            iter_num += 1;
+            iter_total = Duration::ZERO;
+            header_printed = false;
+            continue;
+        }
+        if !header_printed {
+            emit_header(iter_num);
+            header_printed = true;
+        }
+        println!("    {name:<32}  {dur:>10.2?}");
+        // `*_total` records (prove_v2_total, fold_total, verify_fold_statement,
+        // verify_v2_final) wrap the stages above them — accumulate only the
+        // wrappers into the iter total so it matches wall-clock.
+        if name.ends_with("_total")
+            || name == "verify_fold_statement"
+            || name == "verify_v2_final"
+        {
+            iter_total += dur;
+        }
+    }
+}
+
+/// Parse CLI args. Form: `[N] [--threads K]`. Either may be omitted.
+fn parse_args() -> (usize, Option<usize>) {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let mut n: Option<usize> = None;
+    let mut threads: Option<usize> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--threads" => {
+                i += 1;
+                let v = args.get(i).expect("--threads requires a value");
+                threads = Some(v.parse().expect("--threads value must be an integer"));
+            }
+            other => {
+                let v: usize = other.parse().expect("first positional arg is N (a positive integer)");
+                n = Some(v);
+            }
+        }
+        i += 1;
+    }
+    (n.unwrap_or(8), threads)
+}
+
 fn main() {
-    let n: usize = env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(8);
-    println!("Aggregating N={n} Falcon-512 signatures…\n");
+    let (n, threads_override) = parse_args();
+
+    // Install Rayon's global pool if --threads was passed. Otherwise rayon
+    // defaults to `RAYON_NUM_THREADS` (when set) or the available
+    // parallelism. Either way, we report the resulting thread count below
+    // so anyone seeing low CPU utilization can diagnose immediately.
+    if let Some(k) = threads_override {
+        match rayon::ThreadPoolBuilder::new().num_threads(k).build_global() {
+            Ok(()) => {}
+            Err(e) => eprintln!(
+                "note: rayon global pool already initialized (likely via RAYON_NUM_THREADS); \
+                 --threads {k} not applied. err: {e}"
+            ),
+        }
+    }
+
+    let rayon_threads = rayon::current_num_threads();
+    let avail = std::thread::available_parallelism()
+        .map(|n| n.get().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    println!("Aggregating N={n} Falcon-512 signatures…");
+    println!(
+        "  rayon threads: {rayon_threads}   (std::available_parallelism = {avail})\n"
+    );
 
     // --- keygen + sign ---
     let t_sign = Instant::now();
@@ -177,6 +267,12 @@ fn main() {
     let agg_elapsed = bar.finish();
     println!("aggregate:               {:.2?}", agg_elapsed);
 
+    // Drain any prover-side stage timings recorded under STAGE_TIMING=1.
+    // Each ("iter-end", _) is a sentinel separating consecutive iterations.
+    if labrador::stage_timing::is_enabled() {
+        print_stage_table("prove_v2 + fold stage breakdown", labrador::stage_timing::drain());
+    }
+
     let proof_bytes = bincode::serialize(&proof).expect("serialize");
     let proof_size = proof_bytes.len();
     println!("aggregate proof:         {}", fmt_kb(proof_size));
@@ -212,6 +308,10 @@ fn main() {
     verify(&pairs, &proof).expect("verify");
     let ver_elapsed = t_ver.elapsed();
     println!("verify:                  {:.2?}  ✓", ver_elapsed);
+
+    if labrador::stage_timing::is_enabled() {
+        print_stage_table("verifier stage breakdown", labrador::stage_timing::drain());
+    }
 
     // --- size analysis: does aggregation actually save bytes? ---
     println!("\nsize analysis (the headline question — does aggregation beat concatenation?):");

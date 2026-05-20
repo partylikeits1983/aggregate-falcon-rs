@@ -349,8 +349,40 @@ pub fn fold(
 ) -> FoldOutput {
     let last_msg = proof.last_msg.as_ref().expect("fold requires the iteration's last_msg");
     let new_stmt = fold_statement(stmt, proof, it_params, nu, mu, transcript);
+    let witness = build_witness_from_last_msg(stmt, last_msg, it_params, nu, mu);
+    FoldOutput { statement: new_stmt, witness }
+}
 
-    // Build the corresponding honest witness from the openings.
+/// Like [`fold`] but consumes a precomputed [`IterationReplay`] (produced by
+/// [`crate::prover_v2::prove_v2_with_replay`]) and therefore does **no**
+/// transcript work. Behaviour is identical to [`fold`] otherwise — the same
+/// statement and witness are produced — but the per-iteration matrix
+/// expansion and constraint aggregation that `fold` would otherwise repeat
+/// are skipped.
+///
+/// Only safe to call when the replay corresponds to **the same** `stmt`,
+/// `proof`, and `it_params` that were just passed to `prove_v2_with_replay`.
+pub fn fold_with_replay(
+    stmt: &Statement,
+    proof: &IterationProofV2,
+    it_params: &Iteration,
+    nu: usize,
+    mu: usize,
+    replay: &IterationReplay,
+) -> FoldOutput {
+    let last_msg = proof.last_msg.as_ref().expect("fold requires the iteration's last_msg");
+    let new_stmt = fold_statement_with_replay(stmt, proof, it_params, nu, mu, replay);
+    let witness = build_witness_from_last_msg(stmt, last_msg, it_params, nu, mu);
+    FoldOutput { statement: new_stmt, witness }
+}
+
+fn build_witness_from_last_msg(
+    stmt: &Statement,
+    last_msg: &crate::proof::IterationLastMsg,
+    it_params: &Iteration,
+    nu: usize,
+    mu: usize,
+) -> Witness {
     let ring = stmt.ring;
     let m = ring.m;
     let r = stmt.r;
@@ -364,12 +396,11 @@ pub fn fold(
     let h_chunks = decompose_sym(&last_msg.h, &m, b1, t1, r);
     let e_layout = ELayout::new(r, t1, t2, kappa);
     let fold_layout = FoldedLayout::new(stmt.n, e_layout.m, nu, mu);
-    let witness = build_folded_witness(
+    build_folded_witness(
         &fold_layout, &e_layout, stmt.n,
         &last_msg.z0, &last_msg.z1, &v_chunks, &g_chunks, &h_chunks,
         r, t1, t2, kappa,
-    );
-    FoldOutput { statement: new_stmt, witness }
+    )
 }
 
 /// Statement-only fold: produces the next iteration's statement WITHOUT
@@ -384,6 +415,22 @@ pub fn fold_statement(
     nu: usize,
     mu: usize,
     transcript: &mut Transcript,
+) -> Statement {
+    let replay = replay_iteration(stmt, proof, it_params, transcript);
+    fold_statement_with_replay(stmt, proof, it_params, nu, mu, &replay)
+}
+
+/// Same output as [`fold_statement`] but consumes a precomputed
+/// [`IterationReplay`] instead of walking the transcript. Used by the prover
+/// driver to skip the duplicate replay that `fold_statement` would otherwise
+/// run after `prove_v2`.
+pub fn fold_statement_with_replay(
+    stmt: &Statement,
+    proof: &IterationProofV2,
+    it_params: &Iteration,
+    nu: usize,
+    mu: usize,
+    replay: &IterationReplay,
 ) -> Statement {
     assert!(
         matches!(it_params.stage, Stage::First | Stage::Mid),
@@ -402,8 +449,6 @@ pub fn fold_statement(
     let b2 = it_params.b2;
     let t1 = it_params.t1 as usize;
     let t2 = it_params.t2 as usize;
-
-    let replay = replay_iteration(stmt, proof, it_params, transcript);
 
     let e_layout = ELayout::new(r, t1, t2, kappa);
     let fold_layout = FoldedLayout::new(n, e_layout.m, nu, mu);
@@ -543,64 +588,44 @@ fn build_folded_witness(
     let n_prime = fold_layout.n_prime;
     let r_prime = fold_layout.r_prime;
     // The fold layout maps each source position to a unique (witness_idx, off)
-    // slot, so writes are non-overlapping. Collect (wi, off, value) triples
-    // from the four independent index spaces (z0, z1, V, G/H) and apply them
-    // serially. The triples can be produced in parallel since the index spaces
-    // and the per-triple work (which clones a single ring element) are
-    // independent; the apply pass is O(slots) and trivially fast.
+    // slot, so writes are non-overlapping. Earlier versions collected a
+    // parallel `Vec<(usize, usize, RingElem)>` of all writes and then applied
+    // them serially — that intermediate vector doubled peak memory because
+    // each `RingElem` was cloned into the triple before landing in `w`.
+    // For N=256+ that transient is large enough to cause OOM kills on
+    // memory-constrained boxes. The serial write loop below skips the
+    // intermediate entirely; the work is shallow (one clone per output slot)
+    // and not a parallelism bottleneck.
     let mut w: Vec<Vec<RingElem>> = (0..r_prime).map(|_| vec![RingElem::zero(); n_prime]).collect();
 
-    let z_triples: Vec<(usize, usize, RingElem)> = (0..n)
-        .into_par_iter()
-        .flat_map_iter(|p| {
-            let (wi0, off0) = fold_layout.z0(p);
-            let (wi1, off1) = fold_layout.z1(p);
-            [
-                (wi0, off0, z0[p].clone()),
-                (wi1, off1, z1[p].clone()),
-            ]
-        })
-        .collect();
-    for (wi, off, v) in z_triples {
-        w[wi][off] = v;
+    for p in 0..n {
+        let (wi0, off0) = fold_layout.z0(p);
+        w[wi0][off0] = z0[p].clone();
+        let (wi1, off1) = fold_layout.z1(p);
+        w[wi1][off1] = z1[p].clone();
     }
-
-    let v_triples: Vec<(usize, usize, RingElem)> = (0..r)
-        .into_par_iter()
-        .flat_map_iter(|i| {
-            (0..t1).flat_map(move |k| {
-                (0..kappa).map(move |idx| {
-                    let pos = e_layout.pos(EIdx::V(i, k, idx));
-                    let (wi, off) = fold_layout.e(pos);
-                    (wi, off, v_chunks[i][k][idx].clone())
-                })
-            })
-        })
-        .collect();
-    for (wi, off, v) in v_triples {
-        w[wi][off] = v;
+    for i in 0..r {
+        for k in 0..t1 {
+            for idx in 0..kappa {
+                let pos = e_layout.pos(EIdx::V(i, k, idx));
+                let (wi, off) = fold_layout.e(pos);
+                w[wi][off] = v_chunks[i][k][idx].clone();
+            }
+        }
     }
-
-    let gh_triples: Vec<(usize, usize, RingElem)> = (0..r)
-        .into_par_iter()
-        .flat_map_iter(|i| {
-            (i..r).flat_map(move |j| {
-                let gs = (0..t2).map(move |k| {
-                    let pos = e_layout.pos(EIdx::G(i, j, k));
-                    let (wi, off) = fold_layout.e(pos);
-                    (wi, off, g_chunks[i][j][k].clone())
-                });
-                let hs = (0..t1).map(move |k| {
-                    let pos = e_layout.pos(EIdx::H(i, j, k));
-                    let (wi, off) = fold_layout.e(pos);
-                    (wi, off, h_chunks[i][j][k].clone())
-                });
-                gs.chain(hs)
-            })
-        })
-        .collect();
-    for (wi, off, v) in gh_triples {
-        w[wi][off] = v;
+    for i in 0..r {
+        for j in i..r {
+            for k in 0..t2 {
+                let pos = e_layout.pos(EIdx::G(i, j, k));
+                let (wi, off) = fold_layout.e(pos);
+                w[wi][off] = g_chunks[i][j][k].clone();
+            }
+            for k in 0..t1 {
+                let pos = e_layout.pos(EIdx::H(i, j, k));
+                let (wi, off) = fold_layout.e(pos);
+                w[wi][off] = h_chunks[i][j][k].clone();
+            }
+        }
     }
 
     Witness { w }

@@ -65,9 +65,13 @@ fn neg_mul_i64(a: &[i64; FALCON_N], b: &[i64; FALCON_N]) -> [i64; FALCON_N] {
 /// s1 + h·s2 − c = q · v        in R = Z[X]/(X^512 + 1)
 /// ```
 ///
-/// where `q = 12289`. The Falcon verification equation guarantees the left-
-/// hand side is divisible by `q` coefficient-wise; this routine asserts that
-/// and returns `v`.
+/// where `q = 12289`. **Precondition:** the input must satisfy the Falcon
+/// verification equation over the integers — i.e. every coefficient of
+/// `c − s1 − h·s2` must be divisible by `q`. A genuine signature decoded
+/// through [`crate::parse::decode_instance`] always meets this, since the
+/// decoder rebuilds `s1 = c − h·s2 (mod q)`. We enforce it with a real
+/// release-active assertion so any future caller that fabricates `(s1, s2,
+/// h, c)` cannot silently produce a truncated `v` with the wrong norm.
 ///
 /// `c` is the `HashToPoint` output; we use its *centered* coefficients so
 /// `v` ends up as small as possible.
@@ -87,10 +91,10 @@ pub fn compute_v_signed(
     // Paper eq. (6) is s1 + h·s2 + q·v − c = 0, so v = (c − s1 − h·s2) / q.
     for i in 0..FALCON_N {
         let diff = c_i[i] - s1_i[i] - hs2[i];
-        debug_assert_eq!(
-            diff % q,
-            0,
-            "Falcon verification equation must hold over the integers at coeff {i}"
+        assert!(
+            diff % q == 0,
+            "compute_v_signed: Falcon verification equation must hold over the \
+             integers; coeff {i} of (c - s1 - h·s2) = {diff} is not divisible by q={q}"
         );
         out[i] = diff / q;
     }
@@ -742,6 +746,20 @@ mod tests {
     fn ring() -> Ring {
         // A LaBRADOR modulus of realistic size (~2^44, matching N≈100 from Phase 0).
         Ring::new(Modulus::new(find_prime_5mod8(1 << 44)))
+    }
+
+    #[test]
+    #[should_panic(expected = "Falcon verification equation must hold over the integers")]
+    fn compute_v_signed_panics_on_non_divisible_input() {
+        // Fabricate (s1, s2, h, c) where c - s1 - h·s2 is not divisible by q.
+        // Easiest: take s1=s2=h=zero and c = polynomial whose constant coeff is 1.
+        // Then diff[0] = 1 - 0 - 0 = 1, not divisible by 12289.
+        let s1 = FPoly::zero();
+        let s2 = FPoly::zero();
+        let h = FPoly::zero();
+        let mut c = FPoly::zero();
+        c.c[0] = 1;
+        let _ = compute_v_signed(&s1, &s2, &h, &c);
     }
 
     #[test]

@@ -1,27 +1,52 @@
 # Performance plan: cut Falcon aggregation wall-clock
 
+## Status (2026-05-20)
+
+The "no rayon, no NTT, 230h at N=1024" framing below is **historical**. Recent commits (`6932ea4`, `e7fbe17`, and the 2026-05-20 audit-and-perf pass) have already moved the baseline substantially:
+
+- N=8: ~50 s → ~1.5 s
+- N=32: ~10 min (extrapolated) → ~5 s on the user's reference machine
+- N=256: was uncompletable / hours → **~127 s aggregate, ~57 s verify** on the user's reference machine (proof 90.78 KB). On a memory-constrained x86 Ubuntu box, N=256 still OOM-kills (Tier-2 NTT or further memory tightening required).
+
+Tier-1 wins from the original plan that already shipped:
+- **1.1 Rayon everywhere it was needed.** `commit.rs`, `jl.rs`, `garbage.rs`, `prover_v2.rs`, `verifier_v2.rs`, `fold.rs` all use `par_iter`/`into_par_iter` on the parallelism-friendly loops (matrix expansion, projections, garbage chunks, per-`k_pp` constraint aggregation, check-row builders, z amortization). The pre-existing claim of "zero matches" no longer applies.
+- **1.2 Cache expanded matrices between prove and fold.** Landed as `prove_v2_with_replay` + `fold_with_replay` (2026-05-20 pass). Returns the prover's `IterationReplay` (A/B/C/D mats, cs, a_agg, phi_agg, b_agg) and feeds it into `fold` so the fold step does no transcript work. At N=8 this drops iter-0 `fold_total` from ~552ms to ~10ms.
+- **1.3 Clone reduction in fold.** Eliminated the parallel `Vec<(usize, usize, RingElem)>` collect-then-apply pattern in `fold::build_folded_witness` that doubled peak memory before serial application; the writes are now direct and serial. Primary motivation was the OOM kill the user reported at N=256 on the x86 box.
+
+What remains: NTT (Tier 2) and SIMD (Tier 3) — both still deferred per the original plan ordering. Path A's CRT-deepening might let the user run N=256 on the x86 box without OOM. Verify time (57s at N=256) is dominated by transcript-driven work the prover doesn't ship (matrix expansions, JL projection, per-`k_pp` aggregation) and gets done once per `fold_statement` call on the verifier — there is no duplicate-work optimization available there without changing the wire format.
+
 ## The question
 
 Why does aggregating Falcon-512 signatures take so long, and what can we do about it on this machine?
 
-## Where the time goes
+## Where the time goes (per-stage)
+
+A new env-gated instrumentation module `crates/labrador/src/stage_timing.rs` records per-stage timings into a thread-local buffer when `STAGE_TIMING=1`. The roundtrip example drains and prints them. Empirically at N=8 the dominant prover stage is `jl_project` (~50% of `prove_v2_total` at iter 0); on the verifier `fold_statement` per intermediate iter is dominated by the same JL-projection sampling plus per-`k_pp` constraint aggregation.
+
+```
+$ STAGE_TIMING=1 cargo run --release --example roundtrip -p aggregate-falcon -- 32
+```
+
+Use this before deciding on Tier-2/3 work — measure first, then optimize.
+
+## Historical framing (kept for context)
 
 The LaBRADOR prover is **inherently O(N²)** in the number of aggregated signatures — paper §F.1 admits this directly ("the recursion does not start from a balanced state"; first iteration has `r₀ = O(√N)`, `n₀ = O(√N)`, so the dominant `r²·n·D` work is `O(N²·D)`). That asymptotic is not a bug we can fix in software.
 
-What *is* a software problem: the wall-clock cost of one operation step. Measured on this machine (Ryzen 7 7840HS, 8 cores / 16 threads, AVX-512 capable) at commit `c7c5374`:
+What *is* a software problem: the wall-clock cost of one operation step. Originally measured on the development machine (Ryzen 7 7840HS, 8 cores / 16 threads, AVX-512 capable) at commit `c7c5374` — *before* Tier-1 work:
 
 - N=8 release-mode aggregate+verify: ~50 s
 - Extrapolation under O(N²): N=128 ≈ 3.5 h, N=512 ≈ 57 h, N=1024 ≈ 230 h
 
-That extrapolation is the constant factor the implementation is leaving on the table. The five reasons it is this bad on this hardware:
+The five reasons it was that bad on that hardware (all of which Tier-1 either resolved or addressed):
 
-1. **No parallelism whatsoever.** `grep -r 'rayon\|par_iter\|parallel'` across `crates/` returns zero matches in production code. The prover runs on one of 16 hardware threads.
-2. **Schoolbook ring multiplication.** `crates/modring/src/poly.rs:132-149` and `crates/modring/src/crt.rs:80-104` are naive O(D²) negacyclic multiplications — 4096 modular mults per ring multiplication at D = 64. No NTT, no Karatsuba, no FFT.
-3. **No SIMD.** The base loops use scalar `u64`/`u128` arithmetic; the CPU exposes AVX2 *and* AVX-512 (including `avx512ifma`, the 52-bit integer-multiply-add extension that is essentially purpose-built for lattice ring multiplications).
-4. **Hot-loop clones in `fold.rs`.** Lines 512, 514, 521, 530, 535 each `clone()` a `RingElem` (a 64-element `u64` array, ~512 B) inside `O(r·(t₁·κ + t₂·r))` loops.
-5. **Matrix re-expansion.** Every iteration `expand_matrix` for A, B, C, D is rebuilt from the transcript fresh (`crates/labrador/src/commit.rs:18-47`, called from `prover_v2.rs:70,96-97,221` and `fold.rs:217-219`). The expansion is deterministic but uncached, so the prover and the fold each do the same SHAKE-out work twice.
+1. **No parallelism whatsoever.** *Resolved.* Rayon now used in `commit.rs`, `jl.rs`, `garbage.rs`, `prover_v2.rs`, `verifier_v2.rs`, `fold.rs`.
+2. **Schoolbook ring multiplication.** Still true — Tier 2 below.
+3. **No SIMD.** Still true — Tier 3 below.
+4. **Hot-loop clones in `fold.rs`.** *Resolved* for `build_folded_witness` in the 2026-05-20 pass. Other clones in the constraint builders remain.
+5. **Matrix re-expansion.** *Resolved* for the prove→fold pair via `prove_v2_with_replay` + `fold_with_replay`. The verifier still re-derives matrices per iteration since the prover does not ship them; there is no soundness-preserving way to skip this.
 
-These are all implementation concerns, not protocol concerns. Below is the order I would attack them.
+Below is the original order to attack them, kept for the still-pending tiers.
 
 ## Optimization roadmap
 

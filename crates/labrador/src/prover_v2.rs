@@ -19,15 +19,18 @@
 
 use crate::challenge::sample_challenge;
 use crate::commit::{commit_inner, expand_b_mats, expand_matrix, expand_sym_mats, outer_commit_sym, outer_commit_v};
+use crate::fold::IterationReplay;
 use crate::garbage::{compute_g, compute_h, decompose};
 use crate::jl::{build_jl_constraints, project_combined, sample_projection, PROJECTION_ROWS};
 use crate::params::Iteration;
 use crate::proof::{IterationLastMsg, IterationProofV2};
 use crate::prover::{aggregate_full, bind_statement, k_double_prime};
+use crate::stage_timing;
 use crate::statement::{sparse_phi_inner_product, Statement, Witness};
 use crate::transcript::Transcript;
 use modring::{RingElem, D};
 use rayon::prelude::*;
+use std::time::Instant;
 
 const LABEL_A: &[u8] = b"labrador.A";
 const LABEL_B: &[u8] = b"labrador.B";
@@ -47,12 +50,31 @@ const LABEL_CHAL: &[u8] = b"labrador.c";
 ///
 /// `it_params` carries the per-iteration parameters
 /// (`b, t, b1, t1, b2, t2, kappa, kappa1`) from `Params::for_n(N).iterations[0]`.
+///
+/// Thin wrapper around [`prove_v2_with_replay`] that drops the
+/// [`IterationReplay`]. Callers that want to feed the prover's matrix
+/// expansions and aggregated relation straight into [`crate::fold::fold_with_replay`]
+/// (saving one full transcript walk per iteration in the multi-iteration
+/// driver) should use [`prove_v2_with_replay`] directly.
 pub fn prove_v2(
     stmt: &Statement,
     witness: &Witness,
     it_params: &Iteration,
     transcript: &mut Transcript,
 ) -> IterationProofV2 {
+    prove_v2_with_replay(stmt, witness, it_params, transcript).0
+}
+
+/// Like [`prove_v2`] but also returns the [`IterationReplay`] holding every
+/// transcript-derived matrix and aggregated quantity the prover produced. The
+/// fold step can consume this directly via [`crate::fold::fold_with_replay`]
+/// to skip its own redundant transcript walk.
+pub fn prove_v2_with_replay(
+    stmt: &Statement,
+    witness: &Witness,
+    it_params: &Iteration,
+    transcript: &mut Transcript,
+) -> (IterationProofV2, IterationReplay) {
     bind_statement(transcript, stmt);
 
     let ring = &stmt.ring;
@@ -68,11 +90,17 @@ pub fn prove_v2(
     let t2 = it_params.t2 as usize;
 
     // --- Step 1: inner commitments v_i = A·w_i, decompose, outer-commit u_1 ---
+    let t = Instant::now();
     let a_mat = expand_matrix(transcript, LABEL_A, kappa, n, ring);
+    stage_timing::record("expand_A", t.elapsed());
+
+    let t = Instant::now();
     let v = commit_inner(ring, &a_mat, &witness.w);
+    stage_timing::record("commit_inner", t.elapsed());
 
     // Decompose each v_i (length κ) into t1 chunks base b1.
     // v_chunks[i][k] = the k-th chunk of v_i, shape [κ]. Per-`i` independent.
+    let t = Instant::now();
     let v_chunks: Vec<Vec<Vec<RingElem>>> = v
         .par_iter()
         .map(|vi| {
@@ -86,9 +114,12 @@ pub fn prove_v2(
             per_i
         })
         .collect();
+    stage_timing::record("decompose_v", t.elapsed());
 
     // g_{ij} = ⟨w_i, w_j⟩ upper-triangular, decompose into t2 chunks base b2.
+    let t = Instant::now();
     let g = compute_g(ring, &witness.w);
+    stage_timing::record("compute_g", t.elapsed());
     let g_pairs: Vec<(usize, usize)> = (0..r)
         .flat_map(|i| (i..r).map(move |j| (i, j)))
         .collect();
@@ -101,15 +132,18 @@ pub fn prove_v2(
         g_chunks[i][j] = chunks;
     }
 
+    let t = Instant::now();
     let b_mats = expand_b_mats(transcript, LABEL_B, r, t1, kappa1, kappa, ring);
     let c_mats = expand_sym_mats(transcript, LABEL_C, r, t2, kappa1, ring);
     let u1_v = outer_commit_v(ring, &b_mats, &v_chunks);
     let u1_g = outer_commit_sym(ring, &c_mats, &g_chunks);
     let u1: Vec<RingElem> = (0..kappa1).map(|k| u1_v[k].add(m, &u1_g[k])).collect();
     absorb_ring_vec(transcript, LABEL_U1, &u1);
+    stage_timing::record("expand_BC + outer_commit_u1", t.elapsed());
 
     // --- Step 2: JL projection ---
     // Per witness vector i, sample Π_i ∈ {-1, 0, +1}^{2λ × (n·D)}.
+    let t = Instant::now();
     let pis: Vec<Vec<Vec<(usize, i8)>>> = (0..r)
         .map(|i| {
             let label = [LABEL_PI, &(i as u64).to_le_bytes()].concat();
@@ -130,8 +164,10 @@ pub fn prove_v2(
         .cloned()
         .chain(jl_extra.into_iter())
         .collect();
+    stage_timing::record("jl_project", t.elapsed());
 
     // --- Step 3: aggregate F' const-term constraints ---
+    let t = Instant::now();
     let lambda: u32 = 128;
     let k_pp = k_double_prime(stmt, lambda);
     let q = m.q;
@@ -228,8 +264,10 @@ pub fn prove_v2(
         b_double_prime.push(b_k);
     }
     absorb_ring_vec(transcript, LABEL_BPP, &b_double_prime);
+    stage_timing::record("constraint_agg", t.elapsed());
 
     // --- Step 4: aggregate F + F'' → (a_agg, phi_agg); commit h via u_2 ---
+    let t = Instant::now();
     let n_f = stmt.full.len();
     let alphas: Vec<RingElem> = (0..n_f)
         .map(|k| sample_ring_element(transcript, LABEL_ALPHA, k as u64, ring))
@@ -237,9 +275,27 @@ pub fn prove_v2(
     let betas: Vec<RingElem> = (0..k_pp)
         .map(|k| sample_ring_element(transcript, LABEL_BETA, k as u64, ring))
         .collect();
-    let (_a_agg, phi_agg) = aggregate_full(stmt, &alphas, &betas, &a_pp, &phi_pp);
+    let (a_agg, phi_agg) = aggregate_full(stmt, &alphas, &betas, &a_pp, &phi_pp);
+    // Compute b_agg = Σ α_k · b_k + Σ β_k · b''_k so the replay carries the
+    // RHS of the aggregated F + F'' identity that fold_statement (Check 6)
+    // needs. The verifier and the old replay_iteration both compute this
+    // exact sum from the same alphas/betas; doing it here lets the fold's
+    // build_check6 use the precomputed value.
+    let mut b_agg = RingElem::zero();
+    for (k, c) in stmt.full.iter().enumerate() {
+        let term = ring.mul(&alphas[k], &c.b);
+        b_agg = b_agg.add(m, &term);
+    }
+    for k in 0..k_pp {
+        let term = ring.mul(&betas[k], &b_double_prime[k]);
+        b_agg = b_agg.add(m, &term);
+    }
+    stage_timing::record("aggregate_full", t.elapsed());
 
+    let t = Instant::now();
     let h = compute_h(ring, &phi_agg, &witness.w);
+    stage_timing::record("compute_h", t.elapsed());
+    let t = Instant::now();
     let h_pairs: Vec<(usize, usize)> = (0..r)
         .flat_map(|i| (i..r).map(move |j| (i, j)))
         .collect();
@@ -254,8 +310,10 @@ pub fn prove_v2(
     let d_mats = expand_sym_mats(transcript, LABEL_D, r, t1, kappa1, ring);
     let u2 = outer_commit_sym(ring, &d_mats, &h_chunks);
     absorb_ring_vec(transcript, LABEL_U2, &u2);
+    stage_timing::record("expand_D + outer_commit_u2", t.elapsed());
 
     // --- Step 5: amortize z = Σ c_i w_i; decompose z = z^(0) + b·z^(1) ---
+    let t = Instant::now();
     let cs: Vec<RingElem> = (0..r)
         .map(|i| {
             let label = [LABEL_CHAL, &(i as u64).to_le_bytes()].concat();
@@ -291,6 +349,7 @@ pub fn prove_v2(
         z0.push(a);
         z1.push(bb);
     }
+    stage_timing::record("z_amortize + decompose_z", t.elapsed());
 
     // Upper-triangular g matrix for the wire (lower triangle = zero).
     let mut g_wire: Vec<Vec<RingElem>> = vec![vec![RingElem::zero(); r]; r];
@@ -309,7 +368,7 @@ pub fn prove_v2(
 
     let _ = (v_chunks, g_chunks, h_chunks); // chunks are transient; verifier re-derives.
 
-    IterationProofV2 {
+    let proof = IterationProofV2 {
         u1,
         p,
         b_double_prime,
@@ -321,7 +380,18 @@ pub fn prove_v2(
             g: g_wire,
             h: h_wire,
         }),
-    }
+    };
+    let replay = IterationReplay {
+        a_mat,
+        b_mats,
+        c_mats,
+        d_mats,
+        cs,
+        a_agg,
+        phi_agg,
+        b_agg,
+    };
+    (proof, replay)
 }
 
 fn absorb_ring_vec(t: &mut Transcript, label: &[u8], v: &[RingElem]) {
