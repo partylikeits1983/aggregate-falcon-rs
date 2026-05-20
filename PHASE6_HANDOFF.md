@@ -1,13 +1,36 @@
 # Phase 6 handoff — recursive folding for LaBRADOR Falcon-512 aggregation
 
+> **Status**: Session A + B done and pushed (commits `92f1b01`, `784eec4`).
+> You're picking up **Session C** (fold function).
+
 ## What you're picking up
 
-You're implementing **Session B** of Phase 6 (recursive folding). The goal of
-Phase 6 is to make the aggregate proof smaller than naive sig concatenation
-at large N. The paper estimator predicts ≈ 80 KB at N=1024 (vs 666 KB of raw
-sigs — an 8× win). Today's v1 single-iteration proof is **2.86 MB at N=64
-and grows linearly**, so it loses to concatenation at every tested N. Phase 6
-is the fix.
+The goal of Phase 6 is to make the aggregate proof smaller than naive sig
+concatenation at large N. The paper estimator predicts ≈ 80 KB at N=1024 (vs
+666 KB of raw sigs — an 8× win). Today's v1 single-iteration proof is
+**2.86 MB at N=64 and grows linearly**, so it loses to concatenation at every
+tested N. Phase 6 is the fix.
+
+**Sessions A + B already shipped:**
+- Session A (`92f1b01`): outer-commitment helpers in `commit.rs`
+  (`outer_commit_v`, `outer_commit_sym`, `expand_b_mats`, `expand_sym_mats`) + 3 unit tests.
+- Session B (`784eec4`): paper-correct single-iteration `prove_v2`/`verify_v2`
+  in `crates/labrador/src/{prover_v2,verifier_v2}.rs` + `IterationProofV2`
+  in `proof.rs` + 5 tests in `tests/single_iteration_v2.rs`. All 72 tests pass.
+  v1 prover/verifier is **unchanged** and v1 tests are **untouched** — v2
+  lives in parallel.
+
+**Sessions C, D, E still ahead:**
+- Session C (this one): write `fold(stmt, proof_v2, it_params, transcript)
+  → (new_stmt, new_witness)` that translates verifier checks 3-9 of
+  Protocol 3 into LaBRADOR dot-product constraints over a new witness
+  `(z^{(0)}, z^{(1)}, e = v ‖ g_chunks ‖ h_chunks)` with `(ν, μ)` splitting
+  from `Params::for_n(N).iterations[k+1].{prev_nu, prev_mu}`.
+- Session D: recursion driver — top-level loop that runs `prove_v2` →
+  `fold` → `prove_v2` → ... → SecLast. Drop chunks/openings from intermediate
+  iterations. THIS is where proof size finally shrinks below concatenation.
+- Session E: JL projection constraints in `F'` + tighten norm bound to
+  match paper estimator predictions.
 
 ## Read these first, in order
 
@@ -33,7 +56,132 @@ is the fix.
 - v1 prover/verifier still in place at `crates/labrador/src/{prover,verifier}.rs`.
   v1's `IterationProof` shape (in `proof.rs`) is unchanged.
 
-## Session B scope
+## Session C scope (THIS SESSION)
+
+Build `fold(stmt, proof_v2, it_params, transcript) → (new_stmt, new_witness)`.
+The fold is the heart of recursion: it converts the just-completed iteration's
+verifier checks 3-9 into a new LaBRADOR `Statement` whose witness is the data
+the prover would otherwise send in the open. Re-running `prove_v2` on the
+folded `(new_stmt, new_witness)` produces the next iteration's proof.
+
+### Inputs to `fold`
+
+- `stmt`: the statement that `prove_v2` was just run on (so we know `r, n, κ, κ₁, β²`).
+- `proof_v2`: the prover messages `(u_1, p, b'', u_2, z^{(0)}, z^{(1)}, v, g, h)`.
+- `it_params`: `Params::for_n(N).iterations[k]` (current iter).
+- `transcript`: must be at the state AFTER `prove_v2`/`verify_v2` would have
+  finished — so that re-deriving `A, B, C, D, Π, ψ, α, β, c_i` matches both
+  sides exactly. The fold itself only DERIVES these (does not absorb new
+  prover messages).
+- `(ν, μ)`: take from `Params::for_n(N).iterations[k+1].prev_nu / prev_mu`
+  (the params object for iteration `k+1` records the fold parameters that
+  produced its witness from iteration `k`).
+- For the prover side, also pass in the v_chunks / g_chunks / h_chunks (which
+  `prove_v2` discards today — you'll want to plumb them through, or
+  re-compute them deterministically via `garbage::decompose`).
+
+### Logical witness layout `e`
+
+`e ∈ R^m` where `m = r·t₁·κ + t₂·(r(r+1)/2) + t₁·(r(r+1)/2)`:
+- positions `[0, r·t₁·κ)`: `v_chunks[i][k][idx]` at offset
+  `i·t₁·κ + k·κ + idx`.
+- positions `[r·t₁·κ, r·t₁·κ + t₂·r(r+1)/2)`: `g_chunks[(i,j)][k]` for `i ≤ j`,
+  flattened upper-triangle.
+- positions tail: `h_chunks[(i,j)][k]` for `i ≤ j`.
+
+Write a helper `enum EIdx { V(i,k,idx), G(i,j,k), H(i,j,k) } → usize` that
+maps each logical chunk to its position in `e`. Use it everywhere — bare
+arithmetic is too easy to off-by-one.
+
+### `(ν, μ)` splitting
+
+New witness has `r' = 2ν + μ` vectors of common rank `n' = max(⌈n/ν⌉, ⌈m/μ⌉)`.
+- `w'_1, …, w'_ν` ← `z^{(0)}` chopped into ν pieces of length `⌈n/ν⌉`,
+  padded with zeros to length `n'`.
+- `w'_{ν+1}, …, w'_{2ν}` ← `z^{(1)}` similarly.
+- `w'_{2ν+1}, …, w'_{2ν+μ}` ← `e` chopped into μ pieces of length `⌈m/μ⌉`,
+  padded.
+
+For each global position `p` in the original `z^{(0)} / z^{(1)} / e`, you'll
+need a `(witness_idx, local_pos)` lookup. The constraint encoding will use
+this mapping pervasively.
+
+### Constraints to emit (translated from Protocol 3 checks)
+
+For each of these, build either a `DotConstraint` (full equality in S) or a
+`ConstTermConstraint` (only constant term must equal). All of them go into
+`new_stmt.full` or `new_stmt.const_term`. The `b_agg` value that the verifier
+computes from the previous iteration becomes one of the constraint RHS values.
+
+1. **Check 3 (κ constraints, linear)**: per row `k` of `A`,
+   `Σ_j A[k][j]·z^{(0)}[j] + b·Σ_j A[k][j]·z^{(1)}[j] - Σ_i c_i Σ_l b₁^l v_chunks[i][l][k] = 0`.
+   Encoded as `DotConstraint` with only `phi` populated (no quadratic part).
+
+2. **Check 4 (1 constraint, quadratic)**:
+   `⟨z, z⟩ - Σ c_i c_j g_ij = 0` where `z = z^{(0)} + b·z^{(1)}` and
+   `g_ij = Σ_l b₂^l g_chunks[i][j][l]`. Expand:
+   `⟨z^{(0)}, z^{(0)}⟩ + 2b·⟨z^{(0)}, z^{(1)}⟩ + b²·⟨z^{(1)}, z^{(1)}⟩ - Σ_{i,j} c_i c_j Σ_l b₂^l g_chunks[i][j][l] = 0`.
+   The `⟨w_i, w_j⟩` inner products span MULTIPLE folded vectors (since z^{(0)}
+   is now ν vectors); you need cross-terms between every pair `(w_a, w_b)`
+   with `a ∈ z^{(0)} family, b ∈ z^{(0)} family`, etc. This is the most
+   intricate constraint.
+
+3. **Check 5 (1 constraint, bilinear)**:
+   `Σ_i ⟨φ_i, z⟩·c_i - Σ_{i,j} c_i c_j h_ij = 0` where `φ_i` is the aggregated
+   `phi_agg[i]` from iter's verifier. Encoded similarly to check 4 but with
+   linear-in-z part instead of quadratic.
+
+4. **Check 6 (1 constraint, linear)**:
+   `Σ a_{ij}·g_ij + Σ h_ii - b_agg = 0`. Pure linear in `e`.
+
+5. **Check 8 — outer commit `u_1` (κ₁ constraints, linear)**: per row `r₁` of `u_1`,
+   `u_1[r₁] - Σ_i Σ_k B_{i,k}[r₁,:] · v_chunks[i][k] - Σ_{i ≤ j} Σ_k C_{i,j,k}[r₁] · g_chunks[i][j][k] = 0`.
+   Note: the `Σ_i Σ_k B · v_chunks` term has a κ-length dot product inside;
+   it's `Σ_{i,k,idx} B_{i,k}[r₁, idx] · v_chunks[i][k][idx]`. All entries are in
+   `e` so it's purely linear.
+
+6. **Check 9 — outer commit `u_2` (κ₁ constraints, linear)**:
+   `u_2[r₁] - Σ_{i ≤ j} Σ_k D_{i,j,k}[r₁] · h_chunks[i][j][k] = 0`.
+
+The norm bound `β'²` for the new statement is the previously-computed
+`next_beta_sq = it_params.next_beta_list[0]² + it_params.next_beta_list[1]²`.
+
+### New statement size
+
+For N=8 iter[0]→iter[1] (from JSON): `ν=1, μ=7`, `n'=397`, `r'=9`. Constraint
+count: `κ + 1 + 1 + 1 + κ₁ + κ₁ = 19 + 3 + 12 = 34` full constraints (plus
+constant-term constraints from JL deferred to Session E).
+
+### Tests for Session C
+
+Add `tests/fold_v2.rs`:
+- `fold_satisfies_iff_v2_verifies` — generate a real Falcon statement at N=4,
+  run `prove_v2`, run `fold`, check `satisfies(new_stmt, new_witness)`.
+- `fold_witness_norm_within_bound` — `new_witness.norm_sq() ≤ β'²`.
+- `tampering_v2_proof_breaks_fold` — flip a byte of `proof_v2.z0`, verify
+  `satisfies(new_stmt, new_witness_built_from_tampered_proof)` returns false.
+
+### Critical gotchas for Session C
+
+1. **Transcript is consumed twice**: `prove_v2`/`verify_v2` advance the
+   transcript through all challenges. `fold` MUST advance the transcript to
+   the same state — easiest: have `fold` accept the same transcript handle
+   AFTER `prove_v2` runs, then `fold` re-derives the challenges by sampling
+   without absorbing new prover messages.
+
+2. **Symmetric storage of `g, h`**: only `i ≤ j` entries are populated. When
+   building Check 4's `Σ_{i,j} c_i c_j g_ij`, double the `i < j` terms.
+
+3. **Padding**: when `n%ν ≠ 0` or `m%μ ≠ 0`, the last chopped piece is padded
+   with zeros. The constraint encoding must use the SAME mapping for both
+   the witness (where padding zeros are stored) and the constraint φ
+   (where the corresponding positions are not referenced).
+
+4. **`b_agg` is iteration-specific**: it's computed inside `verify_v2` as
+   `Σ α_k b^{(k)} + Σ β_k b''^{(k)}` AND uses the iter's `α, β` challenges.
+   `fold` must rebuild it the same way.
+
+## Original Session B scope (now done — leave for reference)
 
 Add `prove_v2`/`verify_v2` as a parallel implementation **alongside** the
 existing v1. Do not delete v1 in this session — migration of
