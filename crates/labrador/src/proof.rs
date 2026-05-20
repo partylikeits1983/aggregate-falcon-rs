@@ -26,6 +26,37 @@ pub struct IterationProof {
     pub h: Vec<Vec<RingElem>>,
 }
 
+/// v2 iteration proof: paper-correct single-iteration shape from Protocols
+/// 2 & 3. The wire contents are
+/// `(u_1, p, b'', u_2, z^{(0)}, z^{(1)}, v, g, h)` where `v, g, h` are sent in
+/// full and the verifier decomposes them on its side to check `u_1, u_2`
+/// (deterministic centered-base-b decomposition).
+///
+/// Decomposition bases and chunk counts come from
+/// `Params::for_n(N).iterations[0]`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IterationProofV2 {
+    /// Outer commitment to inner-commitment + g chunks. Length `κ₁`.
+    pub u1: Vec<RingElem>,
+    /// JL projection vector `p = Σ Π_i τ(w_i) ∈ Z^{2λ}`.
+    pub p: Vec<i128>,
+    /// Constant-term aggregation polynomials `b''^{(k)}`, length `K''`.
+    pub b_double_prime: Vec<RingElem>,
+    /// Outer commitment to `h` chunks. Length `κ₁`.
+    pub u2: Vec<RingElem>,
+    /// Amortized opening, decomposed as `z = z^{(0)} + b · z^{(1)}`. Length `n`.
+    pub z0: Vec<RingElem>,
+    pub z1: Vec<RingElem>,
+    /// Inner commitments `v_i ∈ R^κ`: outer `[r]`, inner `[κ]`.
+    pub v: Vec<Vec<RingElem>>,
+    /// Quadratic garbage `g_{ij}` for `i ≤ j` — upper-triangular `[r][r]`
+    /// with entries `g[i][j]` populated only for `i ≤ j` (lower triangle
+    /// kept as `RingElem::zero()`).
+    pub g: Vec<Vec<RingElem>>,
+    /// Linear garbage `h_{ij}` for `i ≤ j`, same upper-tri convention as `g`.
+    pub h: Vec<Vec<RingElem>>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AggregateProof {
     /// LaBRADOR modulus `q'`, recorded so the verifier can rebuild the ring
@@ -48,6 +79,9 @@ pub enum VerifyError {
     LinearOpening,
     AggregatedRelation,
     NormBound,
+    OuterCommitment(&'static str),
+    JlBound,
+    BadIterationStage,
     ProofShape(&'static str),
 }
 
@@ -63,6 +97,9 @@ impl std::fmt::Display for VerifyError {
             Self::LinearOpening => write!(f, "linear opening Σ ⟨φ_i, z⟩ c_i ≠ Σ c_i c_j h_ij"),
             Self::AggregatedRelation => write!(f, "aggregated relation Σ a g + Σ h_ii ≠ b"),
             Self::NormBound => write!(f, "witness norm bound exceeded"),
+            Self::OuterCommitment(label) => write!(f, "outer-commitment opening mismatch ({label})"),
+            Self::JlBound => write!(f, "JL projection norm exceeds bound"),
+            Self::BadIterationStage => write!(f, "iteration stage chain is malformed"),
             Self::ProofShape(s) => write!(f, "proof shape invalid: {s}"),
         }
     }

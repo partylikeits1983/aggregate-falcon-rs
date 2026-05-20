@@ -13,8 +13,10 @@ pub mod jl;
 pub mod params;
 pub mod proof;
 pub mod prover;
+pub mod prover_v2;
 pub mod statement;
 pub mod transcript;
 pub mod verifier;
+pub mod verifier_v2;
 
 pub use statement::{ConstTermConstraint, DotConstraint, Statement, Witness};
