@@ -64,8 +64,9 @@ fn wrong_message_rejects() {
 fn flipped_proof_byte_rejects() {
     let (sigs, pairs) = make_sigs(2);
     let mut proof = aggregate(&sigs).expect("aggregate");
-    // Flip a coefficient of the amortized opening z.
-    proof.iteration.z[0].c[0] ^= 1;
+    // Flip a coefficient of the final iteration's amortized opening z0.
+    let last = proof.labrador.final_iter.last_msg.as_mut().unwrap();
+    last.z0[0].c[0] ^= 1;
     assert!(verify(&pairs, &proof).is_err());
 }
 

@@ -6,6 +6,7 @@
 //! - `params`, `commit`, `transcript`, `challenge`, `jl`, `garbage`,
 //!   `prover`, `verifier`, `fold`, `proof` — pending.
 
+pub mod aggregate_v2;
 pub mod challenge;
 pub mod commit;
 pub mod fold;

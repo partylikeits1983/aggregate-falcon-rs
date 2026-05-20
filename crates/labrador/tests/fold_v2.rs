@@ -79,14 +79,15 @@ fn debug_check3_vs_verifier_n4() {
     // Recompose z.
     let mut z: Vec<RingElem> = vec![RingElem::zero(); n];
     for k in 0..n {
-        let chunks = vec![proof.z0[k].clone(), proof.z1[k].clone()];
+        let last = proof.last_msg.as_ref().unwrap();
+        let chunks = vec![last.z0[k].clone(), last.z1[k].clone()];
         z[k] = recompose(&chunks, m, b);
     }
     let az = matmul(&ring, &replay.a_mat, &z);
     let mut expected = vec![RingElem::zero(); kappa];
     for i in 0..stmt.r {
         for k in 0..kappa {
-            let p = ring.mul(&replay.cs[i], &proof.v[i][k]);
+            let p = ring.mul(&replay.cs[i], &proof.last_msg.as_ref().unwrap().v[i][k]);
             expected[k] = expected[k].add(m, &p);
         }
     }
@@ -221,7 +222,8 @@ fn tampering_z0_breaks_fold_consistency() {
     // Mutate z0 AFTER the transcript has been advanced; fold will sample the
     // same challenges, but the witness built from the tampered proof won't
     // satisfy the constraints.
-    proof.z0[0].c[0] = ring.m.add(proof.z0[0].c[0], 1);
+    let v = proof.last_msg.as_ref().unwrap().z0[0].c[0];
+    proof.last_msg.as_mut().unwrap().z0[0].c[0] = ring.m.add(v, 1);
 
     let mut tf = Transcript::new(seed);
     let nu = params.iterations[1].prev_nu as usize;
@@ -246,7 +248,8 @@ fn tampering_v_breaks_fold_consistency() {
 
     let mut tp = Transcript::new(seed);
     let mut proof = prove_v2(&stmt, &witness, it_params, &mut tp);
-    proof.v[0][0].c[0] = ring.m.add(proof.v[0][0].c[0], 1);
+    let v = proof.last_msg.as_ref().unwrap().v[0][0].c[0];
+    proof.last_msg.as_mut().unwrap().v[0][0].c[0] = ring.m.add(v, 1);
 
     let mut tf = Transcript::new(seed);
     let nu = params.iterations[1].prev_nu as usize;

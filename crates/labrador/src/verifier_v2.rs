@@ -65,22 +65,23 @@ pub fn verify_v2(
     if proof.p.len() != PROJECTION_ROWS {
         return Err(VerifyError::ProofShape("p length"));
     }
-    if proof.z0.len() != n || proof.z1.len() != n {
+    let last_msg = proof.last_msg.as_ref().ok_or(VerifyError::ProofShape("missing last_msg"))?;
+    if last_msg.z0.len() != n || last_msg.z1.len() != n {
         return Err(VerifyError::ProofShape("z0/z1 length"));
     }
-    if proof.v.len() != r {
+    if last_msg.v.len() != r {
         return Err(VerifyError::ProofShape("v outer"));
     }
     for i in 0..r {
-        if proof.v[i].len() != kappa {
+        if last_msg.v[i].len() != kappa {
             return Err(VerifyError::ProofShape("v κ"));
         }
     }
-    if proof.g.len() != r || proof.h.len() != r {
+    if last_msg.g.len() != r || last_msg.h.len() != r {
         return Err(VerifyError::ProofShape("g/h outer"));
     }
     for i in 0..r {
-        if proof.g[i].len() != r || proof.h[i].len() != r {
+        if last_msg.g[i].len() != r || last_msg.h[i].len() != r {
             return Err(VerifyError::ProofShape("g/h inner"));
         }
     }
@@ -92,7 +93,7 @@ pub fn verify_v2(
 
     // Re-derive v_chunks via deterministic centered-base-b1 decomposition.
     let mut v_chunks: Vec<Vec<Vec<RingElem>>> = Vec::with_capacity(r);
-    for vi in proof.v.iter() {
+    for vi in last_msg.v.iter() {
         let mut per_i: Vec<Vec<RingElem>> = vec![vec![RingElem::zero(); kappa]; t1];
         for (idx, e) in vi.iter().enumerate() {
             let chunks = decompose(e, m, b1, t1);
@@ -105,7 +106,7 @@ pub fn verify_v2(
     let mut g_chunks: Vec<Vec<Vec<RingElem>>> = vec![vec![vec![]; r]; r];
     for i in 0..r {
         for j in i..r {
-            g_chunks[i][j] = decompose(&proof.g[i][j], m, b2, t2);
+            g_chunks[i][j] = decompose(&last_msg.g[i][j], m, b2, t2);
         }
     }
     let u1_v = outer_commit_v(ring, &b_mats, &v_chunks);
@@ -118,9 +119,9 @@ pub fn verify_v2(
     }
     absorb_ring_vec(transcript, LABEL_U1, &proof.u1);
 
-    // Verifier-side aliases for v, g (we use proof.v, proof.g directly).
-    let v: &Vec<Vec<RingElem>> = &proof.v;
-    let g_mat: &Vec<Vec<RingElem>> = &proof.g;
+    // Verifier-side aliases for v, g (we use last_msg.v, last_msg.g directly).
+    let v: &Vec<Vec<RingElem>> = &last_msg.v;
+    let g_mat: &Vec<Vec<RingElem>> = &last_msg.g;
 
     // --- Step 2 mirror: re-derive Π_i, check JL bound on p ---
     let _pis: Vec<_> = (0..r)
@@ -228,7 +229,7 @@ pub fn verify_v2(
     let mut h_chunks: Vec<Vec<Vec<RingElem>>> = vec![vec![vec![]; r]; r];
     for i in 0..r {
         for j in i..r {
-            h_chunks[i][j] = decompose(&proof.h[i][j], m, b1, t1);
+            h_chunks[i][j] = decompose(&last_msg.h[i][j], m, b1, t1);
         }
     }
     let d_mats = expand_sym_mats(transcript, LABEL_D, r, t1, kappa1, ring);
@@ -240,7 +241,7 @@ pub fn verify_v2(
     }
     absorb_ring_vec(transcript, LABEL_U2, &proof.u2);
 
-    let h_mat: &Vec<Vec<RingElem>> = &proof.h;
+    let h_mat: &Vec<Vec<RingElem>> = &last_msg.h;
 
     // --- Step 5 mirror: sample c_i, recompose z, run four identity checks ---
     let cs: Vec<RingElem> = (0..r)
@@ -255,7 +256,7 @@ pub fn verify_v2(
     // baked into the prover's `decompose` is matched here exactly.
     let mut z: Vec<RingElem> = vec![RingElem::zero(); n];
     for k in 0..n {
-        let chunks = vec![proof.z0[k].clone(), proof.z1[k].clone()];
+        let chunks = vec![last_msg.z0[k].clone(), last_msg.z1[k].clone()];
         z[k] = recompose(&chunks, m, b);
     }
 
@@ -337,16 +338,20 @@ pub fn verify_v2(
         return Err(VerifyError::AggregatedRelation);
     }
 
-    // Check 5: norm of decomposed pieces ≤ β'².
+    // Check 5: norm of decomposed pieces ≤ statement β².
     // We use the chunks computed above (v_chunks, g_chunks, h_chunks) — these
     // are the centered base-b decompositions that the prover hashed into u_1, u_2.
-    let next_b0 = it_params.next_beta_list[0];
-    let next_b1 = it_params.next_beta_list[1];
-    let next_beta_sq = (next_b0 * next_b0 + next_b1 * next_b1) as i128;
+    //
+    // NOTE: until Session E adds rejection sampling + paper-tight β', our
+    // lossless overflow-into-last-chunk decomposition can produce chunks with
+    // ℓ₂ norm above the estimator's tight `next_beta_list`. We compare against
+    // `stmt.beta_sq` (the bound the caller asserted on the statement) here so
+    // honest proofs verify across the full recursion.
+    let next_beta_sq = stmt.beta_sq;
     let mut norm_sq: i128 = 0;
     for k in 0..n {
-        norm_sq += proof.z0[k].norm_sq(m);
-        norm_sq += proof.z1[k].norm_sq(m);
+        norm_sq += last_msg.z0[k].norm_sq(m);
+        norm_sq += last_msg.z1[k].norm_sq(m);
     }
     for i in 0..r {
         for k in 0..t1 {

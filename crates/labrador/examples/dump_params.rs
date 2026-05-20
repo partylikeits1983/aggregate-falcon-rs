@@ -12,10 +12,11 @@ fn main() {
         for (k, it) in p.iterations.iter().enumerate() {
             let b1t1 = (it.b1 as f64).log2() * it.t1 as f64;
             println!(
-                "iter[{k}]: stage={:?} n={} r_list={:?} b={} t={} b1={} t1={} (b1^t1≈2^{:.0}) b2={} t2={} kappa={} kappa1={} prevnu={} prevmu={} logq={}",
+                "iter[{k}]: stage={:?} n={} r_list={:?} b={} t={} b1={} t1={} (b1^t1≈2^{:.0}) b2={} t2={} kappa={} kappa1={} prevnu={} prevmu={} logq={} sigz={:.0} sigh={:.0} beta_list={:?} next_beta_list={:?}",
                 it.stage, it.n, it.r_list, it.b, it.t,
                 it.b1, it.t1, b1t1,
-                it.b2, it.t2, it.kappa, it.kappa1, it.prev_nu, it.prev_mu, it.logq
+                it.b2, it.t2, it.kappa, it.kappa1, it.prev_nu, it.prev_mu, it.logq,
+                it.sigz, it.sigh, it.beta_list, it.next_beta_list,
             );
         }
     }

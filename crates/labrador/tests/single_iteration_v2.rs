@@ -88,7 +88,7 @@ fn tampering_z0_rejects_v2() {
 
     let mut tp = Transcript::new(b"v2-e2e");
     let mut proof = prove_v2(&stmt, &witness, it_params, &mut tp);
-    proof.z0[0].c[0] = ring.m.add(proof.z0[0].c[0], 1);
+    proof.last_msg.as_mut().unwrap().z0[0].c[0] = ring.m.add(proof.last_msg.as_ref().unwrap().z0[0].c[0], 1);
 
     let mut tv = Transcript::new(b"v2-e2e");
     assert!(verify_v2(&stmt, &proof, it_params, &mut tv).is_err());
@@ -105,7 +105,7 @@ fn tampering_v_rejects_v2() {
 
     let mut tp = Transcript::new(b"v2-e2e");
     let mut proof = prove_v2(&stmt, &witness, it_params, &mut tp);
-    proof.v[0][0].c[0] = ring.m.add(proof.v[0][0].c[0], 1);
+    proof.last_msg.as_mut().unwrap().v[0][0].c[0] = ring.m.add(proof.last_msg.as_ref().unwrap().v[0][0].c[0], 1);
 
     let mut tv = Transcript::new(b"v2-e2e");
     assert!(verify_v2(&stmt, &proof, it_params, &mut tv).is_err());

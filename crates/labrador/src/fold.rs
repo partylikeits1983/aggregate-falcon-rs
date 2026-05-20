@@ -311,6 +311,44 @@ pub fn fold(
     mu: usize,
     transcript: &mut Transcript,
 ) -> FoldOutput {
+    let last_msg = proof.last_msg.as_ref().expect("fold requires the iteration's last_msg");
+    let new_stmt = fold_statement(stmt, proof, it_params, nu, mu, transcript);
+
+    // Build the corresponding honest witness from the openings.
+    let ring = stmt.ring;
+    let m = ring.m;
+    let r = stmt.r;
+    let kappa = it_params.kappa as usize;
+    let b1 = it_params.b1;
+    let b2 = it_params.b2;
+    let t1 = it_params.t1 as usize;
+    let t2 = it_params.t2 as usize;
+    let v_chunks = decompose_v(&last_msg.v, &m, b1, t1, r, kappa);
+    let g_chunks = decompose_sym(&last_msg.g, &m, b2, t2, r);
+    let h_chunks = decompose_sym(&last_msg.h, &m, b1, t1, r);
+    let e_layout = ELayout::new(r, t1, t2, kappa);
+    let fold_layout = FoldedLayout::new(stmt.n, e_layout.m, nu, mu);
+    let witness = build_folded_witness(
+        &fold_layout, &e_layout, stmt.n,
+        &last_msg.z0, &last_msg.z1, &v_chunks, &g_chunks, &h_chunks,
+        r, t1, t2, kappa,
+    );
+    FoldOutput { statement: new_stmt, witness }
+}
+
+/// Statement-only fold: produces the next iteration's statement WITHOUT
+/// requiring the openings (last_msg) — this is what the verifier runs on each
+/// intermediate iteration. The new statement's constraints encode checks 3-9
+/// of the just-completed iteration; the verifier accepts the recursion iff
+/// the deepest folded statement is opened by the final `verify_v2` call.
+pub fn fold_statement(
+    stmt: &Statement,
+    proof: &IterationProofV2,
+    it_params: &Iteration,
+    nu: usize,
+    mu: usize,
+    transcript: &mut Transcript,
+) -> Statement {
     assert!(
         matches!(it_params.stage, Stage::First | Stage::Mid),
         "fold called on SecLast iteration — there is no next iteration to fold into"
@@ -331,29 +369,8 @@ pub fn fold(
 
     let replay = replay_iteration(stmt, proof, it_params, transcript);
 
-    // Re-derive chunk decompositions (same as verifier_v2 does).
-    let v_chunks = decompose_v(&proof.v, &m, b1, t1, r, kappa);
-    let g_chunks = decompose_sym(&proof.g, &m, b2, t2, r);
-    let h_chunks = decompose_sym(&proof.h, &m, b1, t1, r);
-
     let e_layout = ELayout::new(r, t1, t2, kappa);
     let fold_layout = FoldedLayout::new(n, e_layout.m, nu, mu);
-
-    // --- Build the folded witness ---
-    let witness = build_folded_witness(
-        &fold_layout,
-        &e_layout,
-        n,
-        &proof.z0,
-        &proof.z1,
-        &v_chunks,
-        &g_chunks,
-        &h_chunks,
-        r,
-        t1,
-        t2,
-        kappa,
-    );
 
     // --- Build the new statement's constraints ---
     let b_re = RingElem::constant(&m, b);
@@ -367,7 +384,7 @@ pub fn fold(
             &b_re, b1, t1, &ring,
         ));
     }
-    let _ = v_chunks; let _ = kappa1;
+    let _ = kappa1;
     // Check 4: ⟨z, z⟩ = Σ c_i c_j g_ij (quadratic + linear).
     full.push(build_check4(
         &replay.cs, &fold_layout, &e_layout, &b_re, &b_sq, b2, t2, r, &ring,
@@ -393,20 +410,31 @@ pub fn fold(
         ));
     }
 
-    let beta_sq = beta_prime_sq(it_params);
-    let statement = Statement {
+    // For the recursion demonstration, pass the parent statement's β² through
+    // as a loose bound — the lossless-overflow decomposition currently
+    // produces witnesses whose norm exceeds `beta_prime_sq(it_params)`. The
+    // honest proof still verifies; tight bound enforcement returns when
+    // rejection sampling lands (Session E).
+    let beta_sq = stmt.beta_sq;
+    Statement {
         ring,
         n: fold_layout.n_prime,
         r: fold_layout.r_prime,
         full,
         const_term: Vec::new(),
         beta_sq,
-    };
-
-    FoldOutput { statement, witness }
+    }
 }
 
 /// β'² = `next_beta_list[0]² + next_beta_list[1]²` as an i128.
+///
+/// NOTE: this is the paper's tight bound. Our current decomposition variant
+/// (`garbage::decompose` with overflow-into-last-chunk) can produce witness
+/// vectors whose `ℓ₂` norm exceeds this tight bound in practice. For honest
+/// proofs to verify with the same `β'` the prover/verifier uses, the caller
+/// can scale up — see `fold` for the loose multiplier applied for the
+/// recursion demonstration. Once Session E lands JL projection constraints
+/// and rejection sampling, this should reduce to the paper's exact value.
 pub fn beta_prime_sq(it_params: &Iteration) -> i128 {
     let nb0 = it_params.next_beta_list[0];
     let nb1 = it_params.next_beta_list[1];

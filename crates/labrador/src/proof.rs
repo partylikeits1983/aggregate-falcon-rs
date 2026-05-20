@@ -32,8 +32,14 @@ pub struct IterationProof {
 /// full and the verifier decomposes them on its side to check `u_1, u_2`
 /// (deterministic centered-base-b decomposition).
 ///
+/// `last_msg` is `Some` for the final iteration of an aggregate proof
+/// (verified directly by `verify_v2`) and `None` for intermediate iterations
+/// (folded into the next iteration's statement — the openings become the next
+/// iteration's witness, so they're not sent on the wire). This is what makes
+/// the recursive aggregate proof smaller than naive concatenation.
+///
 /// Decomposition bases and chunk counts come from
-/// `Params::for_n(N).iterations[0]`.
+/// `Params::for_n(N).iterations[k]`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IterationProofV2 {
     /// Outer commitment to inner-commitment + g chunks. Length `κ₁`.
@@ -44,6 +50,16 @@ pub struct IterationProofV2 {
     pub b_double_prime: Vec<RingElem>,
     /// Outer commitment to `h` chunks. Length `κ₁`.
     pub u2: Vec<RingElem>,
+    /// Last-message openings — present for the final iteration, absent for
+    /// intermediates (their openings become the next iteration's witness).
+    pub last_msg: Option<IterationLastMsg>,
+}
+
+/// Step-5 "last message" of an iteration: the openings that the verifier
+/// directly checks. For an intermediate iteration these are encoded into the
+/// next iteration's witness via `fold`, so they don't appear on the wire.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IterationLastMsg {
     /// Amortized opening, decomposed as `z = z^{(0)} + b · z^{(1)}`. Length `n`.
     pub z0: Vec<RingElem>,
     pub z1: Vec<RingElem>,
@@ -55,6 +71,31 @@ pub struct IterationProofV2 {
     pub g: Vec<Vec<RingElem>>,
     /// Linear garbage `h_{ij}` for `i ≤ j`, same upper-tri convention as `g`.
     pub h: Vec<Vec<RingElem>>,
+}
+
+impl IterationProofV2 {
+    /// Construct an intermediate-iteration proof (no last message — the
+    /// openings will be folded into the next statement's witness).
+    pub fn into_intermediate(mut self) -> Self {
+        self.last_msg = None;
+        self
+    }
+}
+
+/// A multi-iteration LaBRADOR aggregate proof.
+///
+/// `intermediate` has `depth − 1` entries (each with `last_msg = None`).
+/// `final_iter` is the depth-th iteration (`Stage::SecLast`) and carries the
+/// only `last_msg` on the wire. The verifier walks the iterations forward,
+/// folding each intermediate's statement before reaching `final_iter`'s
+/// statement and running the single concluding `verify_v2`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AggregateProofV2 {
+    pub q_prime: u64,
+    pub n_sigs: usize,
+    pub beta_sq: i128,
+    pub intermediate: Vec<IterationProofV2>,
+    pub final_iter: IterationProofV2,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

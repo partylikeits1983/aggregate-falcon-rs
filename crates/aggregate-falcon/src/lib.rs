@@ -22,11 +22,10 @@
 
 use falcon_relation::parse::{decode_instance, decode_public_key, hash_to_point, FalconSig, NONCE_LEN};
 use falcon_relation::relation::build_falcon_statement;
-use labrador::proof::IterationProof;
-use labrador::prover::prove;
-use labrador::transcript::Transcript;
-use labrador::verifier::verify as verify_iteration;
-use modring::{find_prime_5mod8, Modulus, Ring};
+use labrador::aggregate_v2::{prove_aggregate, verify_aggregate};
+use labrador::params::Params;
+use labrador::proof::AggregateProofV2;
+use modring::{Modulus, Ring};
 use serde::{Deserialize, Serialize};
 
 const TRANSCRIPT_DOMAIN: &[u8] = b"aggregate-falcon/v1";
@@ -44,16 +43,16 @@ pub type PublicPair = (Vec<u8>, Vec<u8>);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AggregateProof {
-    /// LaBRADOR modulus `q'`, lifted from Falcon's `q = 12289`.
-    pub q_prime: u64,
     /// Per-signature nonces (needed by the verifier to reconstruct `c`).
     /// Each inner `Vec` is exactly `NONCE_LEN = 40` bytes.
     pub nonces: Vec<Vec<u8>>,
     /// Witness-side norm bound used at prove time (lifted to the verifier
     /// so it can rebuild the same statement deterministically).
     pub beta_sq: i128,
-    /// The (single) iteration's prover messages.
-    pub iteration: IterationProof,
+    /// The recursive LaBRADOR proof — the multi-iteration v2 path. Sessions
+    /// C/D land the intermediate-iteration stripping that makes this shrink
+    /// below `N · sizeof(sig)`.
+    pub labrador: AggregateProofV2,
 }
 
 #[derive(Debug, Clone)]
@@ -94,17 +93,12 @@ impl std::fmt::Display for VerifyError {
 
 impl std::error::Error for VerifyError {}
 
-/// Aggregate-time LaBRADOR modulus selection. Use a 44-bit prime ≡ 5 (mod 8)
-/// — comfortably above the wrap-around bounds for `N ≤ 100` per the Phase 0
-/// estimator. For larger `N`, the bit-length should scale with the witness
-/// norm bound; v1 hard-codes 44 bits for simplicity.
-fn select_qprime() -> u64 {
-    find_prime_5mod8(1 << 44)
-}
-
+/// Generous β² bound for the initial statement. The form constraints already
+/// pin the witness structure; this bound just needs to be loose enough that
+/// the deeply-folded chunks pass the per-iteration norm check. Session E will
+/// tighten this to the paper-correct `Params::for_n(N).beta_init_sq()` once
+/// rejection sampling lands.
 fn select_beta_sq() -> i128 {
-    // Generous bound — the form constraints already pin the structure of the
-    // witness; this just ensures `z` after amortization fits.
     1i128 << 60
 }
 
@@ -113,7 +107,8 @@ pub fn aggregate(sigs: &[FalconInstance]) -> Result<AggregateProof, AggregateErr
         return Err(AggregateError::EmptyInput);
     }
 
-    let q_prime = select_qprime();
+    let params = Params::for_n(sigs.len());
+    let q_prime = params.select_modulus();
     let ring = Ring::new(Modulus::new(q_prime));
 
     // Decode every signature into FalconSig. The result includes (h, c,
@@ -129,16 +124,13 @@ pub fn aggregate(sigs: &[FalconInstance]) -> Result<AggregateProof, AggregateErr
     let beta_sq = select_beta_sq();
     let (statement, witness, _layout) = build_falcon_statement(&parsed, &ring, beta_sq);
 
-    let mut transcript = Transcript::new(TRANSCRIPT_DOMAIN);
-    let iteration = prove(&statement, &witness, &mut transcript);
-
+    let labrador = prove_aggregate(&statement, &witness, &params, TRANSCRIPT_DOMAIN);
     let nonces: Vec<Vec<u8>> = parsed.iter().map(|p| p.nonce.to_vec()).collect();
 
     Ok(AggregateProof {
-        q_prime,
         nonces,
         beta_sq,
-        iteration,
+        labrador,
     })
 }
 
@@ -150,7 +142,15 @@ pub fn verify(pairs: &[PublicPair], proof: &AggregateProof) -> Result<(), Verify
         });
     }
 
-    let ring = Ring::new(Modulus::new(proof.q_prime));
+    let params = Params::for_n(pairs.len());
+    let q_prime = params.select_modulus();
+    if q_prime != proof.labrador.q_prime {
+        return Err(VerifyError::Labrador(labrador::proof::VerifyError::ModulusMismatch {
+            got: proof.labrador.q_prime,
+            want: q_prime,
+        }));
+    }
+    let ring = Ring::new(Modulus::new(q_prime));
 
     // Reconstruct "public" FalconSig views (h from pk; c from nonce + msg).
     // s1, s2 are set to zero — they're never read by the constraint builders
@@ -213,8 +213,5 @@ pub fn verify(pairs: &[PublicPair], proof: &AggregateProof) -> Result<(), Verify
     add_form_constraints_e(&mut stmt, &layout, &ring);
     add_form_constraints_ep(&mut stmt, &layout, &ring);
 
-    let mut transcript = Transcript::new(TRANSCRIPT_DOMAIN);
-    verify_iteration(&stmt, &proof.iteration, &mut transcript).map_err(VerifyError::Labrador)?;
-
-    Ok(())
+    verify_aggregate(&stmt, &proof.labrador, &params, TRANSCRIPT_DOMAIN).map_err(VerifyError::Labrador)
 }

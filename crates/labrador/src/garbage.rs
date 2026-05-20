@@ -44,16 +44,26 @@ pub fn compute_h(
     h
 }
 
-/// Centered base-`b` decomposition of a `RingElem` into `parts` chunks. Each
-/// chunk has every coefficient in `(−b/2, b/2]`.
+/// Lossless centered base-`b` decomposition of a `RingElem` into `parts`
+/// chunks. The first `parts - 1` chunks have every coefficient in
+/// `(−b/2, b/2]`; the LAST chunk absorbs the remaining
+/// `(centered(x.c[k]) - lower) / b^{parts-1}`, which can lie outside that
+/// range when `b^parts < q`.
 ///
-/// We treat each `RingElem` coefficient independently: write the centered
-/// representative as a base-`b` signed digit expansion (high-to-low) of
-/// length `parts`. Returns the chunks in order `[chunk_0, chunk_1, ...,
-/// chunk_{parts−1}]` such that
-/// `x = chunk_0 + base · chunk_1 + base² · chunk_2 + ...`.
+/// `recompose(decompose(x), b) = x` exactly, regardless of `x`'s magnitude —
+/// the recursion's fold step relies on this round-trip.
+///
+/// When `b^parts ≥ q` (the regime the paper's estimator targets for v/h
+/// decompositions, where `b₁^{t₁} ≥ 2^q_bitlen`), the last chunk
+/// automatically also fits in `(−b/2, b/2]`. For decompositions where the
+/// estimator picks smaller `b^parts` (g via `(b₂, t₂)` sized for `σ_h`, and
+/// z via `(b, 2)` sized for `σ_z`), the last chunk holds the overflow — this
+/// is acceptable because the norm-bound check at the next iteration
+/// (`‖z^(0)‖² + ‖z^(1)‖² + ‖ê‖² ≤ β'²`) is on `ℓ₂` of all chunks together,
+/// not per-coefficient `ℓ_∞`.
 pub fn decompose(x: &RingElem, m: &Modulus, base: u64, parts: usize) -> Vec<RingElem> {
     assert!(base >= 1, "base must be ≥ 1");
+    assert!(parts >= 1, "parts must be ≥ 1");
     if base == 1 {
         // No decomposition possible — just return one chunk equal to x.
         let mut chunks = vec![RingElem::zero(); parts];
@@ -65,7 +75,7 @@ pub fn decompose(x: &RingElem, m: &Modulus, base: u64, parts: usize) -> Vec<Ring
     let mut chunks: Vec<RingElem> = vec![RingElem::zero(); parts];
     for k in 0..D {
         let mut v = m.centered(x.c[k]) as i128;
-        for c in 0..parts {
+        for c in 0..(parts - 1) {
             let mut digit = v % b;
             if digit > half {
                 digit -= b;
@@ -75,6 +85,8 @@ pub fn decompose(x: &RingElem, m: &Modulus, base: u64, parts: usize) -> Vec<Ring
             v = (v - digit) / b;
             chunks[c].c[k] = m.from_i64(digit as i64);
         }
+        // Last chunk absorbs any residue exactly.
+        chunks[parts - 1].c[k] = m.from_i64(v as i64);
     }
     chunks
 }

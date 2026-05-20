@@ -22,7 +22,7 @@ use crate::commit::{commit_inner, expand_b_mats, expand_matrix, expand_sym_mats,
 use crate::garbage::{compute_g, compute_h, decompose};
 use crate::jl::{project_combined, sample_projection, PROJECTION_ROWS};
 use crate::params::Iteration;
-use crate::proof::IterationProofV2;
+use crate::proof::{IterationLastMsg, IterationProofV2};
 use crate::prover::{aggregate_full, bind_statement, k_double_prime};
 use crate::statement::{ring_inner_product, sparse_phi_inner_product, Statement, Witness};
 use crate::transcript::Transcript;
@@ -225,7 +225,9 @@ pub fn prove_v2(
             z[k] = z[k].add(m, &p);
         }
     }
-    // Decompose each z[k] into 2 chunks base b.
+    // Decompose each z[k] into 2 chunks base b. The lossless `decompose`
+    // puts any overflow into the high chunk so that
+    // recompose([z0, z1], b) = z holds — fold's Check 4 depends on this.
     let mut z0 = vec![RingElem::zero(); n];
     let mut z1 = vec![RingElem::zero(); n];
     for k in 0..n {
@@ -256,11 +258,13 @@ pub fn prove_v2(
         p,
         b_double_prime,
         u2,
-        z0,
-        z1,
-        v,
-        g: g_wire,
-        h: h_wire,
+        last_msg: Some(IterationLastMsg {
+            z0,
+            z1,
+            v,
+            g: g_wire,
+            h: h_wire,
+        }),
     }
 }
 
