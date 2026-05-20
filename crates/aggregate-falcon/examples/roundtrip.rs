@@ -358,16 +358,16 @@ fn main() {
         println!(
             "                             aggregate-falcon/tests/size_beats_concat.rs)."
         );
-    }
 
-    // Effective break-even: at what hypothetical proof size would aggregation
-    // become strictly better than concatenation? Just a friendly reference.
-    println!(
-        "\n  for reference: at this N, the proof would need to be ≤ {} ({:.2} KB) to beat\n  naive sig concatenation; the v1 proof is {:.2} KB.",
-        sig_total,
-        sig_total as f64 / 1024.0,
-        proof_size as f64 / 1024.0
-    );
+        // Break-even reference: only meaningful when we *haven't* beaten
+        // concatenation yet — shows the threshold the proof must drop under.
+        println!(
+            "\n  for reference: at this N, the proof would need to be ≤ {} ({:.2} KB) to beat\n  naive sig concatenation; the v1 proof is {:.2} KB.",
+            sig_total,
+            sig_total as f64 / 1024.0,
+            proof_size as f64 / 1024.0
+        );
+    }
 
     println!("\nDone.");
 }
