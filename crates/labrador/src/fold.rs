@@ -21,10 +21,12 @@ use crate::jl::{build_jl_constraints, sample_projection, PROJECTION_ROWS};
 use crate::params::{Iteration, Stage};
 use crate::proof::IterationProofV2;
 use crate::prover::{aggregate_full, bind_statement, k_double_prime};
+use crate::stage_timing;
 use crate::statement::{DotConstraint, Statement, Witness};
 use crate::transcript::Transcript;
 use modring::{Modulus, Ring, RingElem, D};
 use rayon::prelude::*;
+use std::time::Instant;
 
 const LABEL_A: &[u8] = b"labrador.A";
 const LABEL_B: &[u8] = b"labrador.B";
@@ -215,11 +217,16 @@ pub fn replay_iteration(
     let t1 = it_params.t1 as usize;
     let t2 = it_params.t2 as usize;
 
+    let ts = Instant::now();
     let a_mat = expand_matrix(transcript, LABEL_A, kappa, n, ring);
+    stage_timing::record("v.replay.expand_A", ts.elapsed());
+    let ts = Instant::now();
     let b_mats = expand_b_mats(transcript, LABEL_B, r, t1, kappa1, kappa, ring);
     let c_mats = expand_sym_mats(transcript, LABEL_C, r, t2, kappa1, ring);
+    stage_timing::record("v.replay.expand_BC", ts.elapsed());
     absorb_ring_vec(transcript, LABEL_U1, &proof.u1);
 
+    let ts = Instant::now();
     let pis: Vec<Vec<Vec<(usize, i8)>>> = (0..r)
         .map(|i| {
             let label = [LABEL_PI, &(i as u64).to_le_bytes()].concat();
@@ -227,9 +234,12 @@ pub fn replay_iteration(
         })
         .collect();
     absorb_p_vec(transcript, LABEL_P, &proof.p);
+    stage_timing::record("v.replay.jl_sample", ts.elapsed());
 
     // Rebuild JL constraints so ψ-aggregation matches prover/verifier.
+    let ts = Instant::now();
     let jl_extra = build_jl_constraints(&pis, &proof.p, n, m);
+    stage_timing::record("v.replay.jl_build", ts.elapsed());
     let const_term_extended: Vec<_> = stmt
         .const_term
         .iter()
@@ -241,6 +251,12 @@ pub fn replay_iteration(
     let k_pp = k_double_prime(stmt, lambda);
     let n_fp = const_term_extended.len();
     let q = m.q;
+    if stage_timing::is_enabled() {
+        eprintln!(
+            "    [dims] n={n} r={r} kappa={kappa} kappa1={kappa1} t1={t1} t2={t2} k_pp={k_pp} n_fp={n_fp} (const_term={})",
+            stmt.const_term.len()
+        );
+    }
     let psis: Vec<Vec<u64>> = (0..k_pp)
         .map(|k| {
             (0..n_fp)
@@ -263,6 +279,7 @@ pub fn replay_iteration(
     // k-indexed per-thread reducers; each k is independent. Collect ordered
     // by k so downstream sequential code sees identical layout.
     let n = stmt.n;
+    let ts = Instant::now();
     let per_k: Vec<(Vec<Vec<RingElem>>, Vec<Vec<(usize, RingElem)>>)> = (0..k_pp)
         .into_par_iter()
         .map(|k| {
@@ -308,6 +325,8 @@ pub fn replay_iteration(
         a_pp.push(a_k);
         phi_pp.push(phi_k);
     }
+    stage_timing::record("v.replay.constraint_agg", ts.elapsed());
+    let ts = Instant::now();
     let (a_agg, phi_agg) = aggregate_full(stmt, &alphas, &betas, &a_pp, &phi_pp);
 
     let mut b_agg = RingElem::zero();
@@ -319,8 +338,11 @@ pub fn replay_iteration(
         let term = ring.mul(&betas[k], &proof.b_double_prime[k]);
         b_agg = b_agg.add(m, &term);
     }
+    stage_timing::record("v.replay.aggregate_full", ts.elapsed());
 
+    let ts = Instant::now();
     let d_mats = expand_sym_mats(transcript, LABEL_D, r, t1, kappa1, ring);
+    stage_timing::record("v.replay.expand_D", ts.elapsed());
     absorb_ring_vec(transcript, LABEL_U2, &proof.u2);
 
     let cs: Vec<RingElem> = (0..r)
@@ -454,6 +476,7 @@ pub fn fold_statement_with_replay(
     let fold_layout = FoldedLayout::new(n, e_layout.m, nu, mu);
 
     // --- Build the new statement's constraints ---
+    let ts_checks = Instant::now();
     let b_re = RingElem::constant(&m, b);
     let b_sq = RingElem::constant(&m, m.mul(b, b));
     let mut full: Vec<DotConstraint> = Vec::new();
@@ -501,6 +524,7 @@ pub fn fold_statement_with_replay(
         })
         .collect();
     full.extend(check9);
+    stage_timing::record("v.fold.build_checks", ts_checks.elapsed());
 
     // For the recursion demonstration, pass the parent statement's β² through
     // as a loose bound — the lossless-overflow decomposition currently
