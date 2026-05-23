@@ -119,43 +119,53 @@ pub fn build_jl_constraints(
     m: &Modulus,
 ) -> Vec<ConstTermConstraint> {
     assert_eq!(p.len(), PROJECTION_ROWS);
-    let r = pis.len();
-    let mut out = Vec::with_capacity(PROJECTION_ROWS);
+    let _ = n; // dims kept for API stability; no longer needed (no dense scratch)
     let neg_one = m.from_i64(-1);
     let plus_one = 1u64;
-    for j in 0..PROJECTION_ROWS {
-        let mut phi: Vec<(usize, Vec<(usize, RingElem)>)> = Vec::with_capacity(r);
-        for (i, pi_i) in pis.iter().enumerate() {
-            // Pack sparse Π_i^(j) into a dense ring vector pi_hat.
-            let mut pi_hat: Vec<RingElem> = vec![RingElem::zero(); n];
-            for &(flat_pos, sign) in &pi_i[j] {
-                let idx = flat_pos / D;
-                let k = flat_pos % D;
-                pi_hat[idx].c[k] = if sign == 1 { plus_one } else { neg_one };
-            }
-            // Apply σ_{-1} per ring element. Collect non-zero positions.
-            let mut sparse_phi: Vec<(usize, RingElem)> = Vec::new();
-            for (pos, e) in pi_hat.iter().enumerate() {
-                if e.is_zero() {
-                    continue;
+    let q = m.q as i128;
+    // Parallelize over the 256 projection rows; each row is independent and the
+    // result Vec stays in j-order (collect preserves index order).
+    (0..PROJECTION_ROWS)
+        .into_par_iter()
+        .map(|j| {
+            let mut phi: Vec<(usize, Vec<(usize, RingElem)>)> = Vec::with_capacity(pis.len());
+            for (i, pi_i) in pis.iter().enumerate() {
+                // `parse_pi_row` emits flat positions in ascending order, so the
+                // sparse row is already grouped by `idx = flat_pos / D`. Stream
+                // it: accumulate the coefficients of one ring element, apply
+                // σ_{-1} once when `idx` advances, and push the non-zero result.
+                // No dense `vec![zero; n]` scratch and no per-position scan.
+                let row = &pi_i[j];
+                let mut sparse_phi: Vec<(usize, RingElem)> = Vec::new();
+                let mut cur_idx: usize = usize::MAX;
+                let mut cur = RingElem::zero();
+                for &(flat_pos, sign) in row {
+                    let idx = flat_pos / D;
+                    let k = flat_pos % D;
+                    if idx != cur_idx {
+                        if cur_idx != usize::MAX {
+                            sparse_phi.push((cur_idx, sigma_minus_one(&cur, m)));
+                        }
+                        cur = RingElem::zero();
+                        cur_idx = idx;
+                    }
+                    cur.c[k] = if sign == 1 { plus_one } else { neg_one };
                 }
-                let s = sigma_minus_one(e, m);
-                sparse_phi.push((pos, s));
+                if cur_idx != usize::MAX {
+                    sparse_phi.push((cur_idx, sigma_minus_one(&cur, m)));
+                }
+                if !sparse_phi.is_empty() {
+                    phi.push((i, sparse_phi));
+                }
             }
-            if !sparse_phi.is_empty() {
-                phi.push((i, sparse_phi));
+            // b0: centered p_j mapped into Z_{q'}.
+            let mut reduced = p[j] % q;
+            if reduced < 0 {
+                reduced += q;
             }
-        }
-        // b0: centered p_j mapped into Z_{q'}.
-        let p_j = p[j];
-        let q = m.q as i128;
-        let mut reduced = p_j % q;
-        if reduced < 0 {
-            reduced += q;
-        }
-        out.push(ConstTermConstraint { a: Vec::new(), phi, b0: reduced as u64 });
-    }
-    out
+            ConstTermConstraint { a: Vec::new(), phi, b0: reduced as u64 }
+        })
+        .collect()
 }
 
 /// Sum projections over many witness vectors: `p_j = Σ_i ⟨π_j^{(i)}, w_i⟩`.

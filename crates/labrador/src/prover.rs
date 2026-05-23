@@ -20,9 +20,11 @@ use crate::challenge::sample_challenge;
 use crate::commit::{commit_inner, expand_matrix};
 use crate::garbage::{compute_g, compute_h};
 use crate::proof::IterationProof;
-use crate::statement::{ring_inner_product, sparse_phi_inner_product, Statement, Witness};
+use crate::statement::{
+    ring_inner_product, sparse_phi_inner_product, ConstTermConstraint, Statement, Witness,
+};
 use crate::transcript::Transcript;
-use modring::{RingElem, D};
+use modring::{Modulus, RingElem, D};
 use rayon::prelude::*;
 
 const LABEL_A: &[u8] = b"labrador.A";
@@ -412,6 +414,109 @@ pub fn aggregate_full(
     }
 
     (a_agg, phi_agg)
+}
+
+/// Per-`k` ψ-aggregation of the constant-term constraints `F'`.
+///
+/// For each `k ∈ [k_pp]` this builds `(a_pp[k], phi_pp[k]) = Σ_l ψ_{k,l} · F'_l`,
+/// the accumulated constraint that the prover, the verifier, and the fold
+/// replay all rebuild identically.
+///
+/// The previous implementation parallelised **only** over `k_pp` (typically 3),
+/// leaving most cores idle while each thread walked all ~2×10⁵ constraints
+/// serially with a full `r × n` dense accumulator. Each `F'_l` is extremely
+/// sparse — `a` is empty and `phi` touches just one or two (witness, position)
+/// pairs — so instead we:
+///
+///   1. index the constraints once by witness id (`by_wi[wi]`), and
+///   2. parallelise over the `k_pp × r` independent (k, witness) cells, each
+///      accumulating only its own length-`n` row.
+///
+/// This gives ~`k_pp·r`-way parallelism with tiny per-task buffers (no 42 MB
+/// dense scratch, no expensive dense merge). The `a` part — non-empty only for
+/// the handful of quadratic constant-term constraints — is summed in a separate
+/// `k`-parallel pass.
+///
+/// Re-association is exact: every accumulation is modular addition (commutative
+/// + associative), so the result is byte-identical to the serial baseline. The
+/// transcript-derived `psis` are computed by the caller and unchanged, so
+/// soundness (challenge derivation order) is untouched.
+pub(crate) fn aggregate_const_term_per_k(
+    const_term: &[ConstTermConstraint],
+    psis: &[Vec<u64>],
+    k_pp: usize,
+    r: usize,
+    n: usize,
+    m: &Modulus,
+) -> (Vec<Vec<Vec<RingElem>>>, Vec<Vec<Vec<(usize, RingElem)>>>) {
+    // Index constraint phi-rows by witness id, once (shared across all k).
+    // `by_wi[wi]` holds (constraint index l, &phi-positions) for every F'_l
+    // that touches witness wi.
+    let mut by_wi: Vec<Vec<(usize, &Vec<(usize, RingElem)>)>> = vec![Vec::new(); r];
+    for (l, c) in const_term.iter().enumerate() {
+        for (wi, phi_i) in &c.phi {
+            by_wi[*wi].push((l, phi_i));
+        }
+    }
+
+    // phi_pp[k][wi]: parallelise over the flattened (k, wi) grid. Each cell
+    // accumulates into a length-n dense row, then emits a sorted sparse row.
+    let cells: Vec<(usize, usize, Vec<(usize, RingElem)>)> = (0..k_pp * r)
+        .into_par_iter()
+        .map(|idx| {
+            let k = idx / r;
+            let wi = idx % r;
+            let psis_k = &psis[k];
+            let mut row: Vec<Option<RingElem>> = vec![None; n];
+            for &(l, phi_i) in &by_wi[wi] {
+                let psi = psis_k[l];
+                if psi == 0 {
+                    continue;
+                }
+                for (pos, coef) in phi_i {
+                    match &mut row[*pos] {
+                        Some(existing) => existing.add_scaled_assign(m, coef, psi),
+                        slot @ None => *slot = Some(coef.scale(m, psi)),
+                    }
+                }
+            }
+            let sparse: Vec<(usize, RingElem)> = row
+                .into_iter()
+                .enumerate()
+                .filter_map(|(p, opt)| opt.map(|coef| (p, coef)))
+                .collect();
+            (k, wi, sparse)
+        })
+        .collect();
+    let mut phi_pp: Vec<Vec<Vec<(usize, RingElem)>>> = vec![vec![Vec::new(); r]; k_pp];
+    for (k, wi, sparse) in cells {
+        phi_pp[k][wi] = sparse;
+    }
+
+    // a_pp[k]: only the rare quadratic constant-term constraints contribute.
+    // Parallelise over k; the empty-`a` majority is skipped in O(1).
+    let a_pp: Vec<Vec<Vec<RingElem>>> = (0..k_pp)
+        .into_par_iter()
+        .map(|k| {
+            let psis_k = &psis[k];
+            let mut a_k: Vec<Vec<RingElem>> = vec![vec![RingElem::zero(); r]; r];
+            for (l, c) in const_term.iter().enumerate() {
+                if c.a.is_empty() {
+                    continue;
+                }
+                let psi = psis_k[l];
+                if psi == 0 {
+                    continue;
+                }
+                for &(i, j, ref aij) in &c.a {
+                    a_k[i][j].add_scaled_assign(m, aij, psi);
+                }
+            }
+            a_k
+        })
+        .collect();
+
+    (a_pp, phi_pp)
 }
 
 fn ceil_log2(x: u64) -> u32 {

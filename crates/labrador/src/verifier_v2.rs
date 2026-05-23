@@ -180,53 +180,11 @@ pub fn verify_v2(
     absorb_ring_vec(transcript, LABEL_BPP, &proof.b_double_prime);
 
     // --- Step 4 mirror: rebuild (a_pp, phi_pp), aggregate F + F'', commit u_2 ---
-    // Same dense-Option accumulator pattern as prover_v2 / fold — see those
-    // for the rationale. Parallelise over k so the verifier scales with cores.
-    use rayon::prelude::*;
-    let per_k_pairs: Vec<(Vec<Vec<RingElem>>, Vec<Vec<(usize, RingElem)>>)> = (0..k_pp)
-        .into_par_iter()
-        .map(|k| {
-            let mut a_pp_k: Vec<Vec<RingElem>> = vec![vec![RingElem::zero(); r]; r];
-            let mut phi_dense: Vec<Vec<Option<RingElem>>> = (0..r)
-                .map(|_| (0..n).map(|_| None).collect())
-                .collect();
-            for (l, c) in const_term_extended.iter().enumerate() {
-                let psi = psis[k][l];
-                if psi == 0 {
-                    continue;
-                }
-                for &(i, j, ref aij) in &c.a {
-                    a_pp_k[i][j].add_scaled_assign(m, aij, psi);
-                }
-                for (wi, phi_i) in &c.phi {
-                    let bucket = &mut phi_dense[*wi];
-                    for (pos, coef) in phi_i {
-                        match &mut bucket[*pos] {
-                            Some(existing) => existing.add_scaled_assign(m, coef, psi),
-                            slot @ None => *slot = Some(coef.scale(m, psi)),
-                        }
-                    }
-                }
-            }
-            let phi_pp_k: Vec<Vec<(usize, RingElem)>> = phi_dense
-                .into_iter()
-                .map(|bucket| {
-                    bucket
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(p, opt)| opt.map(|coef| (p, coef)))
-                        .collect()
-                })
-                .collect();
-            (a_pp_k, phi_pp_k)
-        })
-        .collect();
-    let mut a_pp: Vec<Vec<Vec<RingElem>>> = Vec::with_capacity(k_pp);
-    let mut phi_pp: Vec<Vec<Vec<(usize, RingElem)>>> = Vec::with_capacity(k_pp);
-    for (a_k, phi_k) in per_k_pairs {
-        a_pp.push(a_k);
-        phi_pp.push(phi_k);
-    }
+    // Same dense-Option accumulator pattern as prover_v2 / fold, parallelised
+    // over (k, constraint-chunk) so the verifier scales with cores. The shared
+    // helper guarantees a byte-identical result to the serial path.
+    let (a_pp, phi_pp) =
+        crate::prover::aggregate_const_term_per_k(&const_term_extended, &psis, k_pp, r, n, m);
 
     let alphas: Vec<RingElem> = (0..stmt.full.len())
         .map(|k| sample_ring_element(transcript, LABEL_ALPHA, k as u64, ring))

@@ -24,7 +24,9 @@ use crate::garbage::{compute_g, compute_h, decompose};
 use crate::jl::{build_jl_constraints, project_combined, sample_projection, PROJECTION_ROWS};
 use crate::params::Iteration;
 use crate::proof::{IterationLastMsg, IterationProofV2};
-use crate::prover::{aggregate_full, bind_statement, k_double_prime};
+use crate::prover::{
+    aggregate_const_term_per_k, aggregate_full, bind_statement, k_double_prime,
+};
 use crate::stage_timing;
 use crate::statement::{sparse_phi_inner_product, Statement, Witness};
 use crate::transcript::Transcript;
@@ -183,60 +185,22 @@ pub fn prove_v2_with_replay(
         })
         .collect();
 
-    // Each k builds an independent (a_pp[k], phi_pp[k], b_double_prime[k]).
-    // Parallelise over k and collect at the end so insertion order matches the
-    // serial baseline.
-    let per_k: Vec<(Vec<Vec<RingElem>>, Vec<Vec<(usize, RingElem)>>, RingElem)> = (0..k_pp)
+    // Build (a_pp[k], phi_pp[k]) with the shared aggregator — parallel over k
+    // AND constraint chunks, byte-identical to the serial per-k accumulation.
+    let (a_pp, phi_pp) =
+        aggregate_const_term_per_k(&const_term_extended, &psis, k_pp, r, n, m);
+    // b''_k = Σ_{i≤j} (2−δ_ij)·a_pp[k][i][j]·g[i][j] + Σ_i ⟨phi_pp[k][i], w_i⟩.
+    // Independent per k; reuse the precomputed g[i][j] = ⟨w_i, w_j⟩.
+    let b_double_prime: Vec<RingElem> = (0..k_pp)
         .into_par_iter()
         .map(|k| {
-            let mut a_pp_k: Vec<Vec<RingElem>> = vec![vec![RingElem::zero(); r]; r];
-            // Dense accumulators indexed by (wi, pos). One Option per slot lets
-            // us tell "uninitialized" from "zero" cheaply; the dense layout
-            // replaces the previous push+sort+merge that dominated wall-clock.
-            let mut phi_dense: Vec<Vec<Option<RingElem>>> = (0..r)
-                .map(|_| (0..n).map(|_| None).collect())
-                .collect();
-            for (l, c) in const_term_extended.iter().enumerate() {
-                let psi = psis[k][l];
-                if psi == 0 {
-                    continue;
-                }
-                for &(i, j, ref aij) in &c.a {
-                    a_pp_k[i][j].add_scaled_assign(m, aij, psi);
-                }
-                for (wi, phi_i) in &c.phi {
-                    let bucket = &mut phi_dense[*wi];
-                    for (pos, coef) in phi_i {
-                        match &mut bucket[*pos] {
-                            Some(existing) => existing.add_scaled_assign(m, coef, psi),
-                            slot @ None => *slot = Some(coef.scale(m, psi)),
-                        }
-                    }
-                }
-            }
-            // Convert dense -> sparse. Already sorted by `pos` because we walk
-            // the dense Vec in order.
-            let phi_pp_k: Vec<Vec<(usize, RingElem)>> = phi_dense
-                .into_iter()
-                .map(|bucket| {
-                    bucket
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(p, opt)| opt.map(|coef| (p, coef)))
-                        .collect()
-                })
-                .collect();
-
             let mut b_full = RingElem::zero();
             for i in 0..r {
                 for j in i..r {
-                    let coef = &a_pp_k[i][j];
+                    let coef = &a_pp[k][i][j];
                     if coef.is_zero() {
                         continue;
                     }
-                    // g[i][j] = ⟨w_i, w_j⟩ was already computed above for the
-                    // garbage commitment; reuse it instead of recomputing the
-                    // D=64 ring multiplications per k_pp.
                     let mut term = ring.mul(coef, &g[i][j]);
                     if i != j {
                         term = term.add(m, &term.clone());
@@ -244,25 +208,16 @@ pub fn prove_v2_with_replay(
                     b_full = b_full.add(m, &term);
                 }
             }
-            for (i, phi_i) in phi_pp_k.iter().enumerate() {
+            for (i, phi_i) in phi_pp[k].iter().enumerate() {
                 if phi_i.is_empty() {
                     continue;
                 }
                 let ip = sparse_phi_inner_product(ring, phi_i, &witness.w[i]);
                 b_full = b_full.add(m, &ip);
             }
-            (a_pp_k, phi_pp_k, b_full)
+            b_full
         })
         .collect();
-
-    let mut a_pp: Vec<Vec<Vec<RingElem>>> = Vec::with_capacity(k_pp);
-    let mut phi_pp: Vec<Vec<Vec<(usize, RingElem)>>> = Vec::with_capacity(k_pp);
-    let mut b_double_prime: Vec<RingElem> = Vec::with_capacity(k_pp);
-    for (a_k, phi_k, b_k) in per_k {
-        a_pp.push(a_k);
-        phi_pp.push(phi_k);
-        b_double_prime.push(b_k);
-    }
     absorb_ring_vec(transcript, LABEL_BPP, &b_double_prime);
     stage_timing::record("constraint_agg", t.elapsed());
 

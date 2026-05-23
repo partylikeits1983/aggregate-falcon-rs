@@ -20,7 +20,7 @@ use crate::garbage::decompose;
 use crate::jl::{build_jl_constraints, sample_projection, PROJECTION_ROWS};
 use crate::params::{Iteration, Stage};
 use crate::proof::IterationProofV2;
-use crate::prover::{aggregate_full, bind_statement, k_double_prime};
+use crate::prover::{aggregate_const_term_per_k, aggregate_full, bind_statement, k_double_prime};
 use crate::stage_timing;
 use crate::statement::{DotConstraint, Statement, Witness};
 use crate::transcript::Transcript;
@@ -206,7 +206,9 @@ pub fn replay_iteration(
     it_params: &Iteration,
     transcript: &mut Transcript,
 ) -> IterationReplay {
+    let ts_bind = Instant::now();
     bind_statement(transcript, stmt);
+    stage_timing::record("v.replay.bind_statement", ts_bind.elapsed());
 
     let ring = &stmt.ring;
     let m = &ring.m;
@@ -257,6 +259,7 @@ pub fn replay_iteration(
             stmt.const_term.len()
         );
     }
+    let ts_psis = Instant::now();
     let psis: Vec<Vec<u64>> = (0..k_pp)
         .map(|k| {
             (0..n_fp)
@@ -267,64 +270,26 @@ pub fn replay_iteration(
                 .collect()
         })
         .collect();
+    stage_timing::record("v.replay.psis_derive", ts_psis.elapsed());
     absorb_ring_vec(transcript, LABEL_BPP, &proof.b_double_prime);
 
+    let ts_ab = Instant::now();
     let alphas: Vec<RingElem> = (0..stmt.full.len())
         .map(|k| sample_ring_element(transcript, LABEL_ALPHA, k as u64, ring))
         .collect();
     let betas: Vec<RingElem> = (0..k_pp)
         .map(|k| sample_ring_element(transcript, LABEL_BETA, k as u64, ring))
         .collect();
+    stage_timing::record("v.replay.alphas_betas", ts_ab.elapsed());
 
     // k-indexed per-thread reducers; each k is independent. Collect ordered
     // by k so downstream sequential code sees identical layout.
     let n = stmt.n;
     let ts = Instant::now();
-    let per_k: Vec<(Vec<Vec<RingElem>>, Vec<Vec<(usize, RingElem)>>)> = (0..k_pp)
-        .into_par_iter()
-        .map(|k| {
-            let mut a_pp_k: Vec<Vec<RingElem>> = vec![vec![RingElem::zero(); r]; r];
-            // Dense accumulator (Option per slot) — see prover_v2 mirror.
-            let mut phi_dense: Vec<Vec<Option<RingElem>>> = (0..r)
-                .map(|_| (0..n).map(|_| None).collect())
-                .collect();
-            for (l, c) in const_term_extended.iter().enumerate() {
-                let psi = psis[k][l];
-                if psi == 0 {
-                    continue;
-                }
-                for &(i, j, ref aij) in &c.a {
-                    a_pp_k[i][j].add_scaled_assign(m, aij, psi);
-                }
-                for (wi, phi_i) in &c.phi {
-                    let bucket = &mut phi_dense[*wi];
-                    for (pos, coef) in phi_i {
-                        match &mut bucket[*pos] {
-                            Some(existing) => existing.add_scaled_assign(m, coef, psi),
-                            slot @ None => *slot = Some(coef.scale(m, psi)),
-                        }
-                    }
-                }
-            }
-            let phi_pp_k: Vec<Vec<(usize, RingElem)>> = phi_dense
-                .into_iter()
-                .map(|bucket| {
-                    bucket
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(p, opt)| opt.map(|coef| (p, coef)))
-                        .collect()
-                })
-                .collect();
-            (a_pp_k, phi_pp_k)
-        })
-        .collect();
-    let mut a_pp: Vec<Vec<Vec<RingElem>>> = Vec::with_capacity(k_pp);
-    let mut phi_pp: Vec<Vec<Vec<(usize, RingElem)>>> = Vec::with_capacity(k_pp);
-    for (a_k, phi_k) in per_k {
-        a_pp.push(a_k);
-        phi_pp.push(phi_k);
-    }
+    // Parallelised over (k, constraint-chunk); math-identical to the serial
+    // per-k accumulation. Shared with prover_v2 / verifier_v2.
+    let (a_pp, phi_pp) =
+        aggregate_const_term_per_k(&const_term_extended, &psis, k_pp, r, n, m);
     stage_timing::record("v.replay.constraint_agg", ts.elapsed());
     let ts = Instant::now();
     let (a_agg, phi_agg) = aggregate_full(stmt, &alphas, &betas, &a_pp, &phi_pp);
@@ -345,12 +310,14 @@ pub fn replay_iteration(
     stage_timing::record("v.replay.expand_D", ts.elapsed());
     absorb_ring_vec(transcript, LABEL_U2, &proof.u2);
 
+    let ts_cs = Instant::now();
     let cs: Vec<RingElem> = (0..r)
         .map(|i| {
             let label = [LABEL_CHAL, &(i as u64).to_le_bytes()].concat();
             sample_challenge(transcript, &label, ring)
         })
         .collect();
+    stage_timing::record("v.replay.cs_sample", ts_cs.elapsed());
 
     IterationReplay { a_mat, b_mats, c_mats, d_mats, cs, a_agg, phi_agg, b_agg }
 }
