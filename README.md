@@ -50,21 +50,27 @@ output, and writes a JSON file with machine metadata and per-N results. A run
 that is killed (e.g. OOM at large N) is recorded as `"status": "failed"` and
 the sweep continues.
 
-**Results** (AMD Ryzen 7 7840HS, 16 threads — values pending a clean run):
+**Results** (Apple M4 Pro, 12 threads, `--release`):
 
 | N (sigs) | Naive concat factor¹ | Proof size | Proof gen time | Verification time | Verify slowdown² |
 |---:|---:|---:|---:|---:|---:|
-| 8   | — | — | — | — | — |
-| 32  | — | — | — | — | — |
-| 64  | — | — | — | — | — |
-| 128 | — | — | — | — | — |
-| 256 | — | — | — | — | — |
-| 512 | — | — | — | — | — |
+| 8   | 14.30× | 73.2 KB | 0.81 s  | 0.66 s  | 3,615× |
+| 32  | 3.36×  | 68.9 KB | 2.60 s  | 2.03 s  | 4,077× |
+| 64  | 2.01×  | 82.3 KB | 4.79 s  | 3.55 s  | 3,480× |
+| 128 | 1.07×  | 87.7 KB | 14.07 s | 13.10 s | 6,150× |
+| 256 | 0.55×  | 90.9 KB | 50.90 s | 42.86 s | 9,697× |
+| 512 | —      | —       | —³      | —³      | —      |
 
 ¹ Proof size ÷ Σ|sigᵢ| — the size of naively concatenating the raw signatures.
   Values **< 1.0×** mean the aggregate proof is *smaller* than shipping the raw
-  signatures; **> 1.0×** means concatenation still wins at that N. The crossover
-  sits around N ≈ 1024 analytically.
+  signatures; **> 1.0×** means concatenation still wins at that N. Observed
+  crossover is **≈ N = 140** (break-even at N = 128, clear win by N = 256) — far
+  earlier than the loose analytical bound, because the proof is nearly
+  constant-size while Σ|sigᵢ| grows ~655 B per signature.
+
+³ N = 512 **did not complete** — the process was terminated during aggregation
+  (memory pressure). Current peak memory + runtime make large N impractical
+  without the improvements below.
 
 ² Proof verification time ÷ time to naively verify all N Falcon signatures
   one-by-one (audited C reference impl). This is the *speed* cost of
