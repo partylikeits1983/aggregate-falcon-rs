@@ -33,17 +33,21 @@ fi
 
 # Convert a Rust Duration token to seconds (float). Handles s, ms, µs (micro),
 # us (ascii fallback) and ns — the units `{:.2?}` can emit depending on scale.
+#
+# Avoids substr()/length() on the token: the micro sign "µ" is multibyte and
+# byte-vs-char indexing differs between gawk and BSD/macOS awk. Instead we let
+# awk coerce the leading numeric prefix (`t + 0`) and classify the unit by
+# regex on the suffix — "[0-9]s$" is a plain-seconds tail, while a non-digit
+# before the final "s" (µ or u) marks microseconds.
 to_secs() {
   awk -v t="$1" 'BEGIN{
     if (t == "") { printf "null"; exit }
-    num = t; sub(/[^0-9.].*$/, "", num);   # leading numeric part
-    unit = substr(t, length(num) + 1);     # trailing unit (may be multibyte)
-    v = num + 0;
-    if      (unit == "s")  printf "%.9f", v;
-    else if (unit == "ms") printf "%.9f", v/1e3;
-    else if (unit == "ns") printf "%.9f", v/1e9;
-    else if (unit == "")   printf "%s", t;        # no unit -> pass through
-    else                   printf "%.9f", v/1e6;  # µs / us (microseconds)
+    v = t + 0;                                       # numeric prefix
+    if      (t ~ /ms$/)     printf "%.9f", v/1e3;
+    else if (t ~ /ns$/)     printf "%.9f", v/1e9;
+    else if (t ~ /[0-9]s$/) printf "%.9f", v;        # plain seconds
+    else if (t ~ /s$/)      printf "%.9f", v/1e6;    # µs / us (microseconds)
+    else                    printf "%s", t;          # unknown -> pass through
   }'
 }
 
