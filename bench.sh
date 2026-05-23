@@ -31,13 +31,19 @@ fi
 
 # --- helpers ---------------------------------------------------------------
 
-# Convert a time token (e.g. "1.08s", "951.53ms", "1m2.3s") to seconds (float).
+# Convert a Rust Duration token to seconds (float). Handles s, ms, µs (micro),
+# us (ascii fallback) and ns — the units `{:.2?}` can emit depending on scale.
 to_secs() {
   awk -v t="$1" 'BEGIN{
-    if (t ~ /ms$/)     { sub(/ms$/,"",t); printf "%.6f", t/1000.0 }
-    else if (t ~ /s$/) { sub(/s$/,"",t);  printf "%.6f", t }
-    else if (t == "")  { printf "null" }
-    else               { printf "%s", t }
+    if (t == "") { printf "null"; exit }
+    num = t; sub(/[^0-9.].*$/, "", num);   # leading numeric part
+    unit = substr(t, length(num) + 1);     # trailing unit (may be multibyte)
+    v = num + 0;
+    if      (unit == "s")  printf "%.9f", v;
+    else if (unit == "ms") printf "%.9f", v/1e3;
+    else if (unit == "ns") printf "%.9f", v/1e9;
+    else if (unit == "")   printf "%s", t;        # no unit -> pass through
+    else                   printf "%.9f", v/1e6;  # µs / us (microseconds)
   }'
 }
 
@@ -85,7 +91,7 @@ for N in "${NS[@]}"; do
   # naive Falcon verification baseline (audited C ref impl) — total time to
   # verify all N signatures one-by-one, i.e. what a verifier of concatenated
   # raw signatures would pay.
-  naive_raw="$(grep 'pqcrypto-falcon' "$tmp" | grep -oE '[0-9]+\.[0-9]+(ms|s)' | head -1)"
+  naive_raw="$(grep 'pqcrypto-falcon' "$tmp" | grep -oE '\[[^]]*\]' | head -1 | tr -d '[]')"
 
   prove_s="$(to_secs "$prove_raw")"
   verify_s="$(to_secs "$verify_raw")"
