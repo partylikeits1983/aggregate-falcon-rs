@@ -2,6 +2,24 @@
 
 LaBRADOR-based aggregation of Falcon-512 signatures.
 
+## Research status and limitations
+
+This repository is a research implementation of LaBRADOR-based aggregation for
+Falcon-512 signatures. Its purpose is to study the construction, implement its
+main protocol components, and measure the resulting size and verification-cost
+tradeoff on real signatures.
+
+This implementation is **not suitable for production signature verification**.
+The aggregate proof size is sublinear in the batch size over the measured range:
+it grows much more slowly than a concatenation of `N` signatures. Verification
+is **not succinct**. The verifier reconstructs the public Falcon relation,
+Johnson-Lindenstrauss projection constraints, and recursive folds, and is
+therefore thousands of times slower than direct Falcon verification.
+
+The implementation also retains unresolved protocol limitations, including
+loose recursive norm-bound handling. It is not an audited cryptographic
+implementation.
+
 ## Run aggregation
 
 Aggregate `N` real Falcon-512 signatures, verify, and report sizes:
@@ -64,13 +82,9 @@ the sweep continues.
 ¹ Proof size ÷ Σ|sigᵢ| — the size of naively concatenating the raw signatures.
   Values **< 1.0×** mean the aggregate proof is *smaller* than shipping the raw
   signatures; **> 1.0×** means concatenation still wins at that N. Observed
-  crossover is **≈ N = 140** (break-even at N = 128, clear win by N = 256) — far
+  crossover is **≈ N = 140** (near break-even at N = 128, clear win by N = 256) — far
   earlier than the loose analytical bound, because the proof is nearly
   constant-size while Σ|sigᵢ| grows ~655 B per signature.
-
-³ N = 512 **did not complete** — the process was terminated during aggregation
-  (memory pressure). Current peak memory + runtime make large N impractical
-  without the improvements below.
 
 ² Proof verification time ÷ time to naively verify all N Falcon signatures
   one-by-one (audited C reference impl). This is the *speed* cost of
@@ -78,31 +92,34 @@ the sweep continues.
   slower than just checking the raw signatures. Aggregation trades verification
   speed for proof size — see the notes below.
 
+³ N = 512 **did not complete** — the process was terminated during aggregation
+  (memory pressure). Current peak memory and runtime make large N impractical.
+
 Notes:
 
-- **Proof size is ~constant in N** — the recursive LaBRADOR proof barely grows —
-  so the concat factor falls as N rises. Aggregation is a *bandwidth/storage*
-  win at scale, not a speed win.
-- **Prove and verify time both scale ~linearly in N.** The first fold iteration
-  carries all N signatures' constraints and dominates. The verifier is **not
-  succinct**: it replays the full statement reconstruction, so verify ≈ prove.
+- **Communication is sublinear over the measured range; verification is not.**
+  The recursive proof grows slowly with `N`, so the concat factor falls as `N`
+  rises. This is a bandwidth/storage tradeoff, not a verification-speed win.
+- **The verifier is not succinct.** It replays the public relation and recursive
+  statement reconstruction, including roughly 1.5k initial relation constraints
+  per Falcon signature. At `N = 256`, the proof is `90.9 KB` rather than
+  `167.7 KB` of concatenated signatures, but verification takes `42.86 s`
+  instead of `4.42 ms` for native Falcon verification.
+- **Local optimization cannot close that gap.** Faster arithmetic and additional
+  parallelism can improve constant factors, but the verifier must still
+  reconstruct and check the LaBRADOR relation.
 
-### Future performance improvements
+### Alternative architecture
 
-The hot ring-multiply paths currently use schoolbook O(D²) multiplication, even
-though an NTT-friendly modulus (`q' ≡ 1 mod 2D`) and an `mul_ntt` implementation
-already exist in the `modring` crate — they just aren't wired into the
-prover/verifier yet.
+The current implementation already selects an NTT-friendly modulus and uses its
+NTT-capable ring multiplication path. Further optimization is useful for
+experiments, but does not make this construction a low-latency verifier.
 
-| Improvement | Helps | Expected gain | Risk |
-|---|---|---|---|
-| Wire up the existing NTT (`mul_ntt`) into ring multiplies | prove a lot, verify some | ~3–5× prove, ~1.5× verify | safe, math-identical |
-
-Larger-scope levers, in rough order of impact: parallelize the Fiat-Shamir
-challenge derivation (helps verify, but soundness-sensitive), reduce the
-~1.5k constraints emitted per signature (helps both), and — for verification
-that is genuinely succinct and independent of N — wrap the proof in an outer
-STARK/SNARK so end-verification is milliseconds at any N.
+For a production-oriented system that must compress the verification of many
+Falcon signatures, a better direction is likely to verify the signatures inside
+a zkVM or another succinct proving system and expose one succinct outer proof
+to the final verifier. That is a different architecture, not a refactor of this
+LaBRADOR verifier.
 
 ## Tests
 
