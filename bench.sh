@@ -82,9 +82,19 @@ for N in "${NS[@]}"; do
   proof_bytes="$(grep 'aggregate proof:' "$tmp" | grep -oE '[0-9]+ B' | head -1 | grep -oE '[0-9]+')"
   sig_bytes="$(grep 'what aggregation replaces' "$tmp" | grep -oE '[0-9]+ B' | head -1 | grep -oE '[0-9]+')"
   concat="$(grep 'proof /' "$tmp" | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+  # naive Falcon verification baseline (audited C ref impl) — total time to
+  # verify all N signatures one-by-one, i.e. what a verifier of concatenated
+  # raw signatures would pay.
+  naive_raw="$(grep 'pqcrypto-falcon' "$tmp" | grep -oE '[0-9]+\.[0-9]+(ms|s)' | head -1)"
 
   prove_s="$(to_secs "$prove_raw")"
   verify_s="$(to_secs "$verify_raw")"
+  naive_s="$(to_secs "$naive_raw")"
+  # how many times slower proof verification is than naive sig verification
+  slowdown="$(awk -v v="$verify_s" -v n="$naive_s" 'BEGIN{
+    if (v=="null"||v==""||n=="null"||n==""||n+0==0) printf "null";
+    else printf "%.1f", v/n
+  }')"
 
   # fall back to JSON null for any field we couldn't parse
   : "${proof_bytes:=null}"
@@ -92,8 +102,11 @@ for N in "${NS[@]}"; do
   : "${concat:=null}"
   : "${prove_s:=null}"
   : "${verify_s:=null}"
+  : "${naive_s:=null}"
+  : "${slowdown:=null}"
   prove_raw_j="$( [ -n "$prove_raw" ] && printf '"%s"' "$(json_escape "$prove_raw")" || printf 'null')"
   verify_raw_j="$( [ -n "$verify_raw" ] && printf '"%s"' "$(json_escape "$verify_raw")" || printf 'null')"
+  naive_raw_j="$( [ -n "$naive_raw" ] && printf '"%s"' "$(json_escape "$naive_raw")" || printf 'null')"
 
   entries+=("$(cat <<JSON
     {
@@ -104,12 +117,15 @@ for N in "${NS[@]}"; do
       "sig_concat_bytes": $sig_bytes,
       "prove_seconds": $prove_s,
       "verify_seconds": $verify_s,
+      "naive_sig_verify_seconds": $naive_s,
+      "verify_slowdown_vs_naive": $slowdown,
       "prove_raw": $prove_raw_j,
-      "verify_raw": $verify_raw_j
+      "verify_raw": $verify_raw_j,
+      "naive_sig_verify_raw": $naive_raw_j
     }
 JSON
 )")
-  echo "    N=$N  prove=${prove_raw:-?}  verify=${verify_raw:-?}  proof=${proof_bytes:-?}B  concat=${concat:-?}x" >&2
+  echo "    N=$N  prove=${prove_raw:-?}  verify=${verify_raw:-?}  proof=${proof_bytes:-?}B  concat=${concat:-?}x  naive=${naive_raw:-?}  slowdown=${slowdown:-?}x" >&2
 done
 
 rm -f "$tmp"

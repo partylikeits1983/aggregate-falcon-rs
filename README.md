@@ -52,19 +52,25 @@ the sweep continues.
 
 **Results** (AMD Ryzen 7 7840HS, 16 threads — values pending a clean run):
 
-| N (sigs) | Naive concat factor¹ | Proof size | Proof gen time | Verification time |
-|---:|---:|---:|---:|---:|
-| 8   | — | — | — | — |
-| 32  | — | — | — | — |
-| 64  | — | — | — | — |
-| 128 | — | — | — | — |
-| 256 | — | — | — | — |
-| 512 | — | — | — | — |
+| N (sigs) | Naive concat factor¹ | Proof size | Proof gen time | Verification time | Verify slowdown² |
+|---:|---:|---:|---:|---:|---:|
+| 8   | — | — | — | — | — |
+| 32  | — | — | — | — | — |
+| 64  | — | — | — | — | — |
+| 128 | — | — | — | — | — |
+| 256 | — | — | — | — | — |
+| 512 | — | — | — | — | — |
 
 ¹ Proof size ÷ Σ|sigᵢ| — the size of naively concatenating the raw signatures.
   Values **< 1.0×** mean the aggregate proof is *smaller* than shipping the raw
   signatures; **> 1.0×** means concatenation still wins at that N. The crossover
   sits around N ≈ 1024 analytically.
+
+² Proof verification time ÷ time to naively verify all N Falcon signatures
+  one-by-one (audited C reference impl). This is the *speed* cost of
+  aggregation: e.g. a value of 13,000× means verifying the proof is ~13,000×
+  slower than just checking the raw signatures. Aggregation trades verification
+  speed for proof size — see the notes below.
 
 Notes:
 
